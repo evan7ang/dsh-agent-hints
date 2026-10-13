@@ -1,0 +1,5 @@
+# Bundle patch: mounts the agent hints plugin as one insert row over the
+# profile root (consumed via dsh.bundle.patch in package.json).
+- insert:
+    - id: agent-hints
+      name: 'dsh-agent-hints'

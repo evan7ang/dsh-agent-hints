@@ -1,0 +1,13 @@
+# Keyless wire-capture overlay for e2e/run.sh. The runner substitutes
+# __STUB_BASE_URL__ / __STATUS_SINK__ / __FIXTURE_TOOL__ before use. Two
+# operations in one overlay: mount the probe tool from source, then override
+# the agent-hints row config (raw pass-through to the plugin's apply — the
+# plugin exports no schemastery schema).
+- insert:
+    - id: dsh-agent-hints-e2e-probe
+      name: __FIXTURE_TOOL__
+- id: agent-hints
+  config:
+    baseURL: __STUB_BASE_URL__
+    apiKeyEnv: AGENT_HINTS_E2E_API_KEY
+    statusSink: __STATUS_SINK__

@@ -1,0 +1,51 @@
+{
+  "name": "dsh-agent-hints",
+  "version": "0.2.0",
+  "description": "Per-request serving-intent hints for DeepSeek Harness (dsh): an independent chat-completions provider route (deepseek-hint) carrying the X-Agent-Hint HTTP header (UTF-8 JSON, base64url) on every main-line model request",
+  "license": "Apache-2.0",
+  "author": "evan7ang <the404notrain@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/evan7ang/dsh-agent-hints.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "agent-hints",
+    "llm",
+    "chat-completions"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/adapter.js",
+    "lib/config.js",
+    "lib/hint.js",
+    "lib/status.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/"
+  }
+}
