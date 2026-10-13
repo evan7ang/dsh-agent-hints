@@ -106,6 +106,7 @@ Invalid config aborts composition at load time with a field path — request-tim
 - `call_index`/`epoch`/`state_since_ms` are derived from the session's event log and depend on harness event semantics (`step/start` precedes dispatch; auxiliary calls do not count as loop steps).
 - `derivation.join` reads the parent's most recent delegating tool call — parallel delegations share the latest value (accepted approximation).
 - Switching providers back to `deepseek-official` silently drops hints; the e2e wire assertions below are the safety net.
+- **Always-thinking models**: the session-title auxiliary call forces `thinking: {type: "disabled"}` (official convention). Gateways backed by always-thinking models (e.g. `glm-5.3-flash` on Volcengine) reject it with an error; the harness tolerates the failure — the task itself is unaffected — but such sessions get no generated title. Prefer a model that supports thinking-off for auxiliary calls, or accept untitled sessions (verified on a real gateway: main-line requests with `thinking: enabled` + `reasoning_effort` are accepted, the task completes exit 0, and the hint header reaches the gateway).
 
 ## Development
 

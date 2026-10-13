@@ -106,6 +106,7 @@ API key 逐请求解析：credentials 服务优先（`$DSH_HOME/.credentials.yam
 - `call_index`/`epoch`/`state_since_ms` 派生自会话事件日志，依赖 harness 事件语义（`step/start` 前置于派发；辅助调用不进 loop step 计数）。
 - `derivation.join` 取父会话最近一次委托工具调用——并行委托共享最新值（可接受近似）。
 - 切回 `deepseek-official` 路由会静默失去 hint；下列 e2e wire 断言是兜底。
+- **始终思考的模型**：session-title 辅助调用固定发 `thinking: {type: "disabled"}`（官方约定）。以始终思考模型为后端的网关（如火山引擎 `glm-5.3-flash`）会拒绝该请求并报错；harness 会容忍该失败——任务本身不受影响——但这类会话没有生成的标题。辅助调用建议换用支持关闭思考的模型，或接受无标题会话（已在真实网关实测：主线请求 `thinking: enabled` + `reasoning_effort` 被接受、任务 exit 0、hint 头到达网关）。
 
 ## 开发
 

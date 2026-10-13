@@ -99,7 +99,7 @@ hint 在 HTTP 头里、模型不可见、session log 不记录，**wire 证据�
 
 - **单测**（`node --test`，运行于提交的 built JS，28 项）：hint 构造/编码（base64url 契约）、serialize 各消息形状与 image 拒绝、thinking 解析、SSE 解码（跨 chunk/CRLF/注释行/缺 [DONE]）、translate（delta 流转/延迟终止/usage 拆分/EMPTY_RESPONSE）、HTTP 错误码映射、stream 发射规则（fake fetch：主请求加头、辅助/无会话不加、body 无 hint 字段、call_index 递增、血缘解析）、resolveModel 目录与兜底。
 - **keyless wire e2e（`e2e/run.sh`）**：本地 SSE 捕获 stub（`e2e/stub-server.mjs`，两阶段剧本：`e2e_probe` 回显工具调用 → 终答；工具由 `e2e/fixture-tool.mjs` 经 patch 源路径挂载）+ patch 行 config 把适配器 `baseURL` 指向 stub、`apiKeyEnv` 指向哑环境变量、`statusSink` 指向 scratch 文件，模型路由切 `deepseek-hint` 跑一轮工具往返 → `e2e/capture-check.mjs` 断言：恰 2 个主请求携带 `X-Agent-Hint`、base64url 解码后逐项符合 schema（**call_index 1→2 即 step/start 派生的端到端验证**）、`session_id` 与 `x-deepseek-harness-session-id` 头一致、**body 无任何 hint 字段**、辅助请求（session-title）无 hint 头；状态 sink 断言工作会话 `tool → running → finalize` 序列与 tools[]/call_id 形状。
-- **真机门禁**：`deepseek-hint` 路由指向真实网关（`baseURL` 配置 + `apiKeyEnv` 凭据），真实任务 exit 0 + 独立读回产物。
+- **真机门禁**：`deepseek-hint` 路由指向真实网关（`baseURL` 配置 + `apiKeyEnv` 凭据），真实任务 exit 0 + 独立读回产物。已在真实 OpenAI 兼容网关验证（网关前挂本地记录转发代理）：主线请求 hint 端到端到达、真实工具往返 exit 0、产物独立读回。session-title 辅助调用（`thinking: {type: "disabled"}`）被网关背后的始终思考模型拒绝、harness 容忍该失败——见 §6。
 
 ## 6. 已知边界与后续项
 
@@ -109,3 +109,4 @@ hint 在 HTTP 头里、模型不可见、session log 不记录，**wire 证据�
 - `derivation.join` 取父会话最近一次委托调用的 `run_in_background`——并行委托共享最新值（可接受近似）；子会话 `child_session_id` 绑定为父会话最老未决委托（FIFO）。
 - `finalize` 以 `turn/end(completed)` 为完成判定（一次性 headless 任务语义）；交互式 profile 的会话级终点需另行判定。状态通道 sink 为本地 JSONL，网关客户端替换 `emit()` 接缝后接管重试/顺序语义。
 - `prediction` 待统计引擎；`fork_point`、handoff/suspend 框架触发保持不发射。
+- **始终思考模型的辅助调用**：适配器遵循官方约定，session-title 调用固定 `thinking: {type: "disabled"}`。以始终思考模型为后端的网关会拒绝该形态；harness 容忍该失败（任务不受影响、无生成标题）。支持网关特有思考档位词表（如仅 `low`/`high`/`max`）属适配器层策略变更——后续项。
