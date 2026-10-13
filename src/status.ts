@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * Out-of-band status event channel (field definition §4/§5): the agent
+ * Out-of-band status event channel: the agent
  * framework reports lifecycle state transitions — `tool` (awaiting tool
  * executions), `running` (back to generation), `finalize` (task completion) — as
  * state events, separate from the per-request `X-Agent-Hint` header.
@@ -12,7 +12,7 @@
  * meaningful retry — the gateway implementation owns retry policy).
  *
  * Parallel tool calls: `running` is reported only when the LAST pending call
- * settles (per protocol §5); every `tool/call` re-reports the full pending
+ * settles; every `tool/call` re-reports the full pending
  * set. Subagent delegation: pending entries for delegation tools are named
  * `agent:<toolName>` and gain `child_session_id` when the child session first
  * surfaces on the firehose (FIFO binding to the oldest unbound entry).
@@ -23,7 +23,7 @@
 import { appendFileSync } from 'node:fs'
 import type { SessionEventLike, SessionLike } from '@deepseek-ai/cordis'
 
-/** One wire status event (field definition §4 table rows ②/③/⑤…). */
+/** One wire status event. */
 export interface StatusEvent {
   session: { session_id: string }
   agent_status: {
@@ -99,8 +99,8 @@ export class StatusObserver {
       return
     }
     if (event.type === 'turn/end' && event.data?.reason?.kind === 'completed') {
-      // Business-side completion verdict for the one-shot office bundle: a
-      // completed turn means the task finished (headless exit path). DSH's
+      // Business-side completion verdict for one-shot headless tasks: a
+      // completed turn means the task finished. DSH's
       // `agent/status` `idle` is NOT mapped (protocol finalize ≠ idle).
       this.pending.delete(session.id)
       this.emit({

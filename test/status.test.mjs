@@ -25,11 +25,11 @@ test('tool/call reports tool state; running only after the LAST parallel result'
   const { observer, events } = harness()
   const s = session('s1')
 
-  observer.onEvent(s, { type: 'tool/call', time: 10, data: { name: 'synthesized_process', callId: 'c1' } })
-  observer.onEvent(s, { type: 'tool/call', time: 11, data: { name: 'office_inspect', callId: 'c2' } })
+  observer.onEvent(s, { type: 'tool/call', time: 10, data: { name: 'probe_tool', callId: 'c1' } })
+  observer.onEvent(s, { type: 'tool/call', time: 11, data: { name: 'inspect_files', callId: 'c2' } })
   assert.deepEqual(events[0].agent_status, {
     state: 'tool', state_since_ms: 10, reason: 'await_tool',
-    tools: [{ name: 'synthesized_process', call_id: 'c1' }],
+    tools: [{ name: 'probe_tool', call_id: 'c1' }],
   })
   assert.equal(events.at(-1).agent_status.tools.length, 2)
 
@@ -84,6 +84,6 @@ test('appendStatusEvent writes protocol-shaped JSONL lines in order', () => {
   assert.equal(lines.length, 2)
   assert.equal(lines[0].agent_status.state, 'tool')
   assert.equal(lines[1].agent_status.state, 'finalize')
-  assert.equal('nvext' in lines[0], false)
+  assert.equal('agent_hints' in lines[0], false)
   rmSync(dir, { recursive: true, force: true })
 })

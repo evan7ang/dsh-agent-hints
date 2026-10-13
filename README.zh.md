@@ -1,14 +1,14 @@
 # dsh-agent-hints
 
-面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的逐请求服务意图 hint 插件：每次主请求在 **`X-Agent-Hint` HTTP 头**（UTF-8 JSON，base64url）上携带结构化 AgentHint——会话身份、agent 状态、优先级、缓存控制——让推理网关等服务引擎能够观察并响应 agent 的当前状态，即"Agent 发信号、引擎认信号"范式（与 [NVIDIA Dynamo Agent Hints](https://docs.nvidia.com/dynamo/zh-CN/dev/agents/agent-hints) 同族）。
+面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的逐请求服务意图 hint 插件：每次主请求在 **`X-Agent-Hint` HTTP 头**（UTF-8 JSON，base64url）上携带结构化 AgentHint——会话身份、agent 状态、优先级、缓存控制——让推理网关等服务引擎能够观察并响应 agent 的当前状态，即"Agent 发信号、引擎认信号"范式。
 
 插件注册**独立 provider 路由 `deepseek-hint`**，由自实现的 chat-completions 适配器承载。官方 `deepseek-official` 路由保持 mounted 并作为兜底；部署经 `agent-default-model.provider` 切换。零 harness 源码修改、零 harness 运行时依赖（运行时服务仅以结构化鸭子类型触碰）。
 
-[English](README.md) | 中文
+[English](README.md) | 中文 · 设计记录：[docs/design.zh.md](docs/design.zh.md)（[English](docs/design.md)）
 
 ## 工作原理
 
-harness `LlmAdapter` 契约极薄（仅 `stream()` 必需），而官方适配器在 `request()` 内联构造 HTTP 头、无扩展点。因此本插件自实现适配器契约并追加一个头：
+harness `LlmAdapter` 契约极薄（仅 `stream()` 必需），而官方适配器在其 `request()` 实现内部构造 HTTP 头、无扩展点。因此本插件自实现适配器契约并追加一个头：
 
 ```http
 POST {baseURL}/chat/completions

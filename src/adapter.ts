@@ -2,8 +2,8 @@
 /**
  * The hinted DeepSeek chat-completions adapter: a structural implementation of
  * the harness `LlmAdapter` contract (only `stream()` is required) that carries
- * the AgentHint on the `X-Agent-Hint` HTTP header (UTF-8 JSON, base64url) per
- * the field definition — the request body keeps the provider's original format
+ * the AgentHint on the `X-Agent-Hint` HTTP header (UTF-8 JSON, base64url) —
+ * the request body keeps the provider's original format
  * and never carries hint fields.
  *
  * v1 subset: chat-completions wire, text + tools + thinking + usage + abort;
@@ -487,7 +487,7 @@ export class HintedDeepSeekAdapter {
       'authorization': `Bearer ${await this.options.resolveApiKey()}`,
       'content-type': 'application/json',
       'accept': 'text/event-stream',
-      'user-agent': 'deepseek-harness-agent-hints/0.2 (+https://github.com/AscendAgent)',
+      'user-agent': 'dsh-agent-hints/0.2 (+https://github.com/evan7ang/dsh-agent-hints)',
       // Identity/intent signals mirror the official adapter's conventions so
       // gateway consumers see the same transport metadata on this route.
       ...options.sessionId !== undefined

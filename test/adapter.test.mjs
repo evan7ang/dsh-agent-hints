@@ -35,7 +35,7 @@ test('serializeRequest maps system/user/assistant/tool-result messages to the wi
         message('assistant', [
           { type: 'reasoning', text: 'thinking' },
           textBlock('calling'),
-          { type: 'tool-call', id: 'call-1', name: 'synthesized_process', arguments: '{"step_id":"START"}' },
+          { type: 'tool-call', id: 'call-1', name: 'probe_tool', arguments: '{"message":"START"}' },
         ]),
         message('user', [{ type: 'tool-result', toolCallId: 'call-1', content: [textBlock('tool out')] }]),
       ],
@@ -50,13 +50,13 @@ test('serializeRequest maps system/user/assistant/tool-result messages to the wi
       role: 'assistant',
       content: 'calling',
       reasoning_content: 'thinking',
-      tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'synthesized_process', arguments: '{"step_id":"START"}' } }],
+      tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'probe_tool', arguments: '{"message":"START"}' } }],
     },
     { role: 'tool', tool_call_id: 'call-1', content: 'tool out' },
   ])
   assert.equal(wire.stream, true)
   assert.deepEqual(wire.stream_options, { include_usage: true })
-  assert.equal('nvext' in wire, false, 'body must never carry hint fields')
+  assert.equal('agent_hints' in wire, false, 'body must never carry hint fields')
 })
 
 test('serializeRequest omits empty user messages that only carry tool results and pads empty tool output', () => {
@@ -226,7 +226,7 @@ test('stream adds the X-Agent-Hint header on main-line requests only, with a cle
     assert.equal(typeof main.init.headers['x-agent-hint'], 'string')
     const hint = JSON.parse(Buffer.from(main.init.headers['x-agent-hint'], 'base64url').toString('utf8'))
     assert.deepEqual(hint, buildAgentHint({ sessionId: 's1', callIndex: 1, epoch: 0, runningSinceMs: 111 }, OPTIONS, hint.agent_status.state_since_ms))
-    assert.equal('nvext' in JSON.parse(main.init.body), false)
+    assert.equal('agent_hints' in JSON.parse(main.init.body), false)
     assert.equal('x-agent-hint' in title.init.headers, false)
     assert.equal('x-agent-hint' in anonymous.init.headers, false)
   } finally {

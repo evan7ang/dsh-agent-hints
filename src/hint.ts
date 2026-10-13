@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * AgentHint construction per the Agent Hint field definition (字段&实现定义):
- * the schema is the protocol contract, the values are derived from DSH runtime
+ * AgentHint construction: the schema is the protocol contract, the values are
+ * derived from DSH runtime
  * facts (sessionId, session header lineage, session event tracking). Pure and
  * side-effect free so the wire shape is unit-testable without a harness.
  *
@@ -38,7 +38,7 @@ export interface AgentHintAgentStatus {
   tools?: Array<{ name: string; call_id?: string; child_session_id?: string }>
 }
 
-/** `priority` / `strict_priority` block. `strict_priority` is never sent by an agent: the field definition reserves it for a trusted control plane. */
+/** `priority` / `strict_priority` block. `strict_priority` is never sent by an agent: it is reserved for a trusted control plane. */
 export interface AgentHintPriority {
   level: number
   reason: string
@@ -56,7 +56,7 @@ export interface AgentHintCacheControl {
   }
 }
 
-/** The complete AgentHint object sent under `nvext.agent_hints`. */
+/** The complete AgentHint object encoded into the `X-Agent-Hint` header value. */
 export interface AgentHint {
   session: AgentHintSession
   agent_status?: AgentHintAgentStatus
@@ -148,8 +148,8 @@ export function buildAgentHint(facts: HintRequestFacts, options: HintOptions, no
 
 /**
  * Encode one AgentHint as the `X-Agent-Hint` header value: UTF-8 JSON,
- * base64url (per the field definition — base64, URL-safe alphabet, no
- * padding symbols on the wire since Buffer's base64url omits `=`).
+ * base64url (base64 with a URL-safe alphabet; no `=` padding on the wire
+ * since Buffer's base64url omits it).
  * @param hint - the assembled hint object.
  */
 export function encodeAgentHintHeader(hint: AgentHint): string {

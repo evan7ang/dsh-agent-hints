@@ -57,7 +57,7 @@ hintRequests.forEach((entry, index) => {
   if ('prediction' in hint) fail(`request ${index}: prediction must not be sent in v1`)
 
   // Body stays in the provider's original format: no hint field anywhere.
-  if (Object.hasOwn(entry.body, 'nvext') || Object.hasOwn(entry.body, 'agent_hints')) {
+  if (Object.hasOwn(entry.body, 'agent_hints')) {
     fail(`request ${index}: request body must not carry hint fields (header-only protocol)`)
   }
 

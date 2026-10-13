@@ -54,7 +54,7 @@ const EVENTS = [
 test('apply derives serving facts from the session log and join from the delegating call', async () => {
   const log = [
     { type: 'step/start', time: 1 },
-    { type: 'tool/call', time: 2, data: { name: 'synthesized_process', callId: 'c1' } },
+    { type: 'tool/call', time: 2, data: { name: 'probe_tool', callId: 'c1' } },
     { type: 'tool/result', time: 3, data: { message: { content: [{ type: 'tool-result', toolCallId: 'c1' }] } } },
     { type: 'step/start', time: 4 },
   ]

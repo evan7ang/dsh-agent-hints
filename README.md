@@ -1,14 +1,14 @@
 # dsh-agent-hints
 
-Per-request serving-intent hints for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): every main-line model request carries a structured **AgentHint on the `X-Agent-Hint` HTTP header** (UTF-8 JSON, base64url) — session identity, agent status, priority, and cache control — so a serving engine (your inference gateway) can observe and act on what the agent is doing, per the "agent signals, engine consumes" pattern (the same family as [NVIDIA Dynamo Agent Hints](https://docs.nvidia.com/dynamo/zh-CN/dev/agents/agent-hints)).
+Per-request serving-intent hints for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): every main-line model request carries a structured **AgentHint on the `X-Agent-Hint` HTTP header** (UTF-8 JSON, base64url) — session identity, agent status, priority, and cache control — so a serving engine (your inference gateway) can observe and act on what the agent is doing, per the "agent signals, engine consumes" pattern.
 
 The plugin registers an **independent provider route `deepseek-hint`** backed by its own chat-completions adapter. The official `deepseek-official` route stays mounted and remains the fallback; deployment switches via `agent-default-model.provider`. Zero harness source modification, zero harness runtime dependencies (cordis is touched as a structural duck type only).
 
-English | [中文](README.zh.md)
+English | [中文](README.zh.md) · Design notes: [docs/design.md](docs/design.md) ([中文](docs/design.zh.md))
 
 ## How it works
 
-The harness `LlmAdapter` contract is thin (only `stream()` is required), and the official adapter builds its HTTP headers inline with no extension point. This plugin therefore ships a self-contained adapter that implements the contract structurally and adds one header:
+The harness `LlmAdapter` contract is thin (only `stream()` is required), and the official adapter constructs its HTTP headers inside its `request()` implementation with no extension point. This plugin therefore ships a self-contained adapter that implements the contract structurally and adds one header:
 
 ```http
 POST {baseURL}/chat/completions

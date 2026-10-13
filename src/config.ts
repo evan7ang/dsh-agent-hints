@@ -48,7 +48,7 @@ export interface PluginConfig {
 
 export const DEFAULT_AGENT_TYPE = 'agent'
 
-/** Reference behavior from the field definition's own examples: interactive work waiting on the user. */
+/** Interactive work waiting on the user. */
 export const DEFAULT_PRIORITY: AgentHintPriority = { level: 3, reason: 'user_waiting' }
 
 /** Pin the system prompt (message range [0, 1)): the byte-stable prefix is already guaranteed by the loop; this declares the intent explicitly. */

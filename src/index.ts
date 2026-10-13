@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * The agent hints plugin: per-request serving-intent hints carried on the
- * `X-Agent-Hint` HTTP header (UTF-8 JSON, base64url) of official-DeepSeek-
- * vocabulary chat requests, per the Agent Hint field definition. The plugin
+ * `X-Agent-Hint` HTTP header (UTF-8 JSON, base64url) of DeepSeek
+ * chat-completions requests. The plugin
  * registers an independent provider route (`deepseek-hint`) backed by its own
  * structural LlmAdapter implementation — the official `llm-deepseek` route
  * stays untouched and remains the fallback. Self-contained: no harness-internal
  * runtime imports.
  *
- * Header emission rules (Agent Hint 字段&实现定义 §4/§5):
+ * Header emission rules:
  * - main-line requests only: auxiliary calls (purpose compaction/session-title)
  *   and requests without a session identity carry no hint;
  * - `strict_priority` is never sent by an agent (trusted-control-plane field);
  * - `prediction` is not sent: it requires an observation statistics engine
- *   (future data-flywheel item).
+ *   (future item).
  * The request body keeps the provider's original format and NEVER carries
  * hint fields.
  *
