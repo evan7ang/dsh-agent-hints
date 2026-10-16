@@ -5,11 +5,13 @@
  * executions), `running` (back to generation), `finalize` (task completion) — as
  * state events, separate from the per-request `X-Agent-Hint` header.
  *
- * v1 sink is a local JSONL file (append-only, per-emission order), standing in
- * for the future scheduler gateway; `emit()` is the seam a gateway client
- * replaces. Emission order is per-session by construction (the firehose is
- * ordered); append failures warn rather than queue (a local file sink has no
- * meaningful retry — the gateway implementation owns retry policy).
+ * v1 sinks: a local JSONL file (append-only, per-emission order) and an HTTP
+ * endpoint sink (`HttpStatusSink`, the scheduler/Motor status endpoint) — both
+ * fire from the same `emit()` seam in emission order; a gateway client
+ * replaces the HTTP sink there. Emission order is per-session by construction
+ * (the firehose is ordered); append failures warn rather than queue (a local
+ * file sink has no meaningful retry — the gateway implementation owns retry
+ * policy).
  *
  * Parallel tool calls: `running` is reported only when the LAST pending call
  * settles; every `tool/call` re-reports the full pending
@@ -49,6 +51,65 @@ export function appendStatusEvent(sinkPath: string, event: StatusEvent, warn?: (
       appendFileSync(sinkPath, line)
     } catch (error) {
       warn?.(`agent-hints: status sink append failed: ${String(error)} (first: ${String(firstError)})`)
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * HTTP sink: POST StatusEvents to the scheduler endpoint (Motor Phase 4)
+ * ------------------------------------------------------------------ */
+
+const HTTP_RETRY_DELAYS_MS = [200, 400, 800]
+const HTTP_TIMEOUT_MS = 5_000
+
+/**
+ * One HTTP status sink: POSTs each event to the configured endpoint. A single
+ * emitter instance owns one serial queue, so events reach the endpoint in
+ * emission order (the firehose order = per-session order) even under retries;
+ * a failing delivery retries with bounded backoff, then WARNs and drops that
+ * event — the queue never blocks indefinitely and later events keep flowing
+ * (a stuck scheduler must not stall the agent). Replace with a gateway client
+ * for richer delivery semantics; `send()` is the seam.
+ */
+export class HttpStatusSink {
+  private queue: Promise<void> = Promise.resolve()
+
+  constructor(
+    private readonly endpoint: string,
+    private readonly warn?: (message: string) => void,
+  ) {}
+
+  /** Enqueue one event; returns immediately (ordering and retries happen on the queue). */
+  send(event: StatusEvent): void {
+    this.queue = this.queue.then(() => this.deliver(event))
+  }
+
+  /** Wait for the queue to drain (test/teardown convenience). */
+  drain(): Promise<void> {
+    return this.queue
+  }
+
+  private async deliver(event: StatusEvent): Promise<void> {
+    const body = JSON.stringify(event)
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const response = await fetch(this.endpoint, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body,
+          signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+        })
+        if (response.ok) return
+        throw new Error(`HTTP ${response.status}`)
+      } catch (error) {
+        const delay = HTTP_RETRY_DELAYS_MS[attempt]
+        if (delay === undefined) {
+          this.warn?.(`agent-hints: status endpoint ${this.endpoint} delivery failed after`
+            + ` ${HTTP_RETRY_DELAYS_MS.length + 1} attempts, event dropped: ${String(error)}`)
+          return
+        }
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
     }
   }
 }

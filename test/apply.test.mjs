@@ -9,10 +9,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply } from '../lib/index.js'
+import { normalizeConfig } from '../lib/config.js'
 
 function fakeContext({ sessions, credentials } = {}) {
   const adapters = []
   const listeners = []
+  const infos = []
+  const warns = []
   const ctx = {
     llm: {
       registerAdapter(providers, adapter) {
@@ -29,9 +32,12 @@ function fakeContext({ sessions, credentials } = {}) {
       listeners.push([event, listener])
     },
     effect() {},
-    logger: { info() {}, warn() {} },
+    logger: {
+      info(message) { infos.push(message) },
+      warn(message) { warns.push(message) },
+    },
   }
-  return { ctx, adapters, listeners }
+  return { ctx, adapters, listeners, infos, warns }
 }
 
 function sseResponse(events) {
@@ -90,15 +96,19 @@ test('apply derives serving facts from the session log and join from the delegat
 
 async function collect(streamChunks) {
   let headerCapture
+  let lastUrl
+  let authorization
   const originalFetch = globalThis.fetch
-  globalThis.fetch = async (_url, init) => {
+  globalThis.fetch = async (url, init) => {
     headerCapture = init.headers['x-agent-hint']
+    lastUrl = String(url)
+    authorization = init.headers.authorization
     return sseResponse(EVENTS)
   }
   try {
     const chunks = []
     for await (const chunk of streamChunks) chunks.push(chunk)
-    return { chunks, headerCapture }
+    return { chunks, headerCapture, lastUrl, authorization }
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -112,6 +122,39 @@ test('apply without a session store falls back to a per-process ordinal', async 
   const second = JSON.parse(Buffer.from((await collect(adapters[0].stream(options))).headerCapture, 'base64url').toString('utf8'))
   assert.equal(first.session.call_index, 1)
   assert.equal(second.session.call_index, 2)
+})
+
+test('unconfigured apply inherits the host endpoint and activates', async () => {
+  const originalBaseURL = process.env.DEEPSEEK_BASE_URL
+  process.env.DEEPSEEK_BASE_URL = 'http://motor.local:18201/v1'
+  try {
+    const { ctx, adapters, listeners, infos } = fakeContext({ credentials: { resolve: async () => ({ value: 'sk' }) } })
+    apply(ctx)
+    assert.equal(adapters.length, 1, 'zero-config: adapter registers with inherited facts')
+    assert.match(infos[0], /inheriting the DSH host endpoint/)
+    assert.equal(listeners.filter(([event]) => event === 'session/event').length, 1)
+    const run = await collect(adapters[0].stream({ provider: 'deepseek-hint', model: 'm', messages: [], sessionId: 's1' }))
+    assert.equal(run.lastUrl, 'http://motor.local:18201/v1/chat/completions', 'inherited baseURL')
+    assert.equal(run.authorization, 'Bearer sk', 'credential service resolves the inherited ref')
+  } finally {
+    if (originalBaseURL === undefined) delete process.env.DEEPSEEK_BASE_URL
+    else process.env.DEEPSEEK_BASE_URL = originalBaseURL
+  }
+})
+
+test('config normalization: absent fields inherit the host chain, provided-invalid throws', () => {
+  const originalBaseURL = process.env.DEEPSEEK_BASE_URL
+  process.env.DEEPSEEK_BASE_URL = 'http://motor.local:18201/v1'
+  try {
+    const inherited = normalizeConfig(undefined)
+    assert.equal(inherited.baseURL, 'http://motor.local:18201/v1', 'inherits $DEEPSEEK_BASE_URL')
+    assert.equal(inherited.apiKeyEnv, 'DEEPSEEK_API_KEY', 'credential ref inherits the official default')
+    assert.throws(() => normalizeConfig({ baseURL: 'not-a-url' }), /baseURL/)
+    assert.throws(() => normalizeConfig({ baseURL: 'http://gw.local/v1', apiKeyEnv: '' }), /apiKeyEnv/)
+  } finally {
+    if (originalBaseURL === undefined) delete process.env.DEEPSEEK_BASE_URL
+    else process.env.DEEPSEEK_BASE_URL = originalBaseURL
+  }
 })
 
 test('status sink activates only when configured and records the session lifecycle', async () => {
@@ -134,5 +177,48 @@ test('status sink activates only when configured and records the session lifecyc
     assert.deepEqual(lines.map(line => line.agent_status.state), ['tool', 'finalize'])
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('statusAuto derives the HTTP endpoint from baseURL origin; explicit override wins; default off', async () => {
+  const originalFetch = globalThis.fetch
+  try {
+    // Derivation strips any baseURL path (/v1) and appends the conventional path.
+    const derivedUrls = []
+    const { ctx, listeners } = fakeContext({ credentials: { resolve: async () => ({ value: 'sk' }) } })
+    apply(ctx, { baseURL: 'http://motor.local:18201/v1', apiKeyEnv: 'K', statusAuto: true })
+    const eventListeners = listeners.filter(([event]) => event === 'session/event').map(([, listener]) => listener)
+    eventListeners[1](
+      { id: 's1', header: {}, ownEvents: () => [] },
+      { type: 'tool/call', time: 1, data: { name: 't', callId: 'c1' } },
+    )
+    globalThis.fetch = async url => {
+      derivedUrls.push(String(url))
+      return new Response('{"ok":true}', { status: 200 })
+    }
+    await new Promise(resolve => setTimeout(resolve, 10))
+    assert.deepEqual(derivedUrls, ['http://motor.local:18201/agent-status'])
+
+    // Explicit statusEndpoint overrides the derivation.
+    const overrideUrls = []
+    const { ctx: ctx2, listeners: listeners2 } = fakeContext()
+    apply(ctx2, { baseURL: 'http://motor.local:18201/v1', apiKeyEnv: 'K', statusAuto: true, statusEndpoint: 'http://other.local/status' })
+    listeners2.filter(([event]) => event === 'session/event').map(([, listener]) => listener)[1](
+      { id: 's1', header: {}, ownEvents: () => [] },
+      { type: 'tool/call', time: 1, data: { name: 't', callId: 'c1' } },
+    )
+    globalThis.fetch = async url => {
+      overrideUrls.push(String(url))
+      return new Response('{"ok":true}', { status: 200 })
+    }
+    await new Promise(resolve => setTimeout(resolve, 10))
+    assert.deepEqual(overrideUrls, ['http://other.local/status'])
+
+    // Default off: no status observer beyond join tracking.
+    const { ctx: ctx3, listeners: listeners3 } = fakeContext()
+    apply(ctx3, { baseURL: 'http://motor.local:18201/v1', apiKeyEnv: 'K' })
+    assert.equal(listeners3.filter(([event]) => event === 'session/event').length, 1, 'join tracking only')
+  } finally {
+    globalThis.fetch = originalFetch
   }
 })

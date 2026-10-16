@@ -9,7 +9,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { StatusObserver, appendStatusEvent } from '../lib/status.js'
+import { StatusObserver, appendStatusEvent, HttpStatusSink } from '../lib/status.js'
 
 function session(id, header = {}) {
   return { id, header }
@@ -86,4 +86,73 @@ test('appendStatusEvent writes protocol-shaped JSONL lines in order', () => {
   assert.equal(lines[1].agent_status.state, 'finalize')
   assert.equal('agent_hints' in lines[0], false)
   rmSync(dir, { recursive: true, force: true })
+})
+
+const EVENT_A = { session: { session_id: 's1' }, agent_status: { state: 'tool', state_since_ms: 1 } }
+const EVENT_B = { session: { session_id: 's1' }, agent_status: { state: 'running', state_since_ms: 2 } }
+const EVENT_C = { session: { session_id: 's1' }, agent_status: { state: 'finalize', state_since_ms: 3 } }
+
+test('HttpStatusSink posts events in emission order', async () => {
+  const originalFetch = globalThis.fetch
+  const received = []
+  globalThis.fetch = async (_url, init) => {
+    received.push(JSON.parse(init.body))
+    return new Response('{"ok":true}', { status: 200 })
+  }
+  try {
+    const sink = new HttpStatusSink('http://motor.local/agent-status')
+    sink.send(EVENT_A)
+    sink.send(EVENT_B)
+    sink.send(EVENT_C)
+    await sink.drain()
+    assert.deepEqual(received, [EVENT_A, EVENT_B, EVENT_C])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('HttpStatusSink retries a failing delivery then succeeds, preserving order', async () => {
+  const originalFetch = globalThis.fetch
+  let attempts = 0
+  const received = []
+  globalThis.fetch = async (_url, init) => {
+    attempts += 1
+    if (attempts <= 2) return new Response('boom', { status: 503 })
+    received.push(JSON.parse(init.body))
+    return new Response('{"ok":true}', { status: 200 })
+  }
+  try {
+    const sink = new HttpStatusSink('http://motor.local/agent-status')
+    sink.send(EVENT_A)
+    sink.send(EVENT_B)
+    await sink.drain()
+    assert.equal(attempts, 4, 'EVENT_A retries twice then succeeds (3 calls), EVENT_B succeeds on the first (1 call)')
+    assert.deepEqual(received, [EVENT_A, EVENT_B])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('HttpStatusSink warns and drops after retries are exhausted, then keeps flowing', async () => {
+  const originalFetch = globalThis.fetch
+  const warns = []
+  const delivered = []
+  let calls = 0
+  globalThis.fetch = async (_url, init) => {
+    calls += 1
+    if (calls <= 4) return new Response('down', { status: 503 })
+    delivered.push(JSON.parse(init.body))
+    return new Response('{"ok":true}', { status: 200 })
+  }
+  try {
+    const sink = new HttpStatusSink('http://motor.local/agent-status', w => warns.push(w))
+    sink.send(EVENT_A)
+    sink.send(EVENT_B)
+    sink.send(EVENT_C)
+    await sink.drain()
+    assert.equal(warns.length, 1, 'first event exhausts retries and warns once')
+    assert.deepEqual(delivered, [EVENT_B, EVENT_C], 'later events keep flowing after a drop')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })

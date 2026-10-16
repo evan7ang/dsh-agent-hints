@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 /**
  * Plugin configuration normalization: raw patch-row config (plain JSON) into
- * validated runtime options. Invalid shapes fail at composition with a field
+ * validated runtime options. The config is a pure OVERRIDE layer over the DSH
+ * host's endpoint/credential facts — absent fields inherit, so the plugin
+ * works with zero config. Invalid shapes fail at composition with a field
  * path — never per request. No schemastery: this is an out-of-tree plugin with
  * zero harness runtime dependencies.
  *
@@ -18,11 +20,11 @@ export interface ModelCatalogEntry {
   maxTokens: number
 }
 
-/** Validated plugin configuration. */
+/** Validated plugin configuration. Every field carries an inherited default; the patch-row config only overrides. */
 export interface PluginConfig {
-  /** Upstream endpoint base; every chat request posts to `${baseURL}/chat/completions`. */
+  /** Upstream endpoint base; every chat request posts to `${baseURL}/chat/completions`. Inherits `$DEEPSEEK_BASE_URL` → the public API default. */
   baseURL: string
-  /** Credential reference (environment-variable name) resolved per request. */
+  /** Credential reference (environment-variable name) resolved per request; inherits `DEEPSEEK_API_KEY`. */
   apiKeyEnv: string
   /** Agent type reported as `session.agent_type`. */
   agentType: string
@@ -40,8 +42,12 @@ export interface PluginConfig {
   defaultContextWindow: number
   /** Per-request output cap materialized when callers omit one. */
   defaultMaxTokens: number
-  /** Local JSONL sink path for out-of-band status events; unset disables the status channel (the gateway client will replace the sink). */
+  /** Local JSONL sink path for out-of-band status events; unset disables the file sink (the gateway client will replace the sink). */
   statusSink?: string
+  /** Full status-event endpoint URL; overrides the `statusAuto` derivation when set (non-default paths or a separate status service). */
+  statusEndpoint?: string
+  /** Derive the status endpoint from `baseURL`'s origin (`<origin>/agent-status`, the Motor-coordinator convention) when no explicit `statusEndpoint` is set. */
+  statusAuto?: boolean
   /** Tool names treated as subagent delegation for `derivation.join` and `agent:<name>` status naming. */
   subagentToolNames: string[]
 }
@@ -64,6 +70,24 @@ export const DEFAULT_MODELS: ModelCatalogEntry[] = [
 const DEFAULT_REASONING_EFFORT = 'high'
 const DEFAULT_CONTEXT_WINDOW = 1_000_000
 const DEFAULT_MAX_TOKENS = 256_000
+const DEFAULT_API_KEY_ENV = 'DEEPSEEK_API_KEY'
+
+/**
+ * The inherited endpoint chain, mirroring the official llm-deepseek adapter's
+ * own resolution: its settings-section `baseURL` is NOT readable from another
+ * plugin (the settings section reader is private to the registrant), but the
+ * public fallback sources are — `$DEEPSEEK_BASE_URL` (the official trusted-env
+ * knob) then the public API default. Endpoint/credential facts therefore live
+ * in the DSH host (launch environment + credentials service) and this plugin's
+ * own config becomes a pure per-field override.
+ */
+function inheritedBaseURL(): string {
+  return process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com'
+}
+
+function inheritedApiKeyEnv(): string {
+  return process.env.DEEPSEEK_API_KEY_ENV ?? DEFAULT_API_KEY_ENV
+}
 
 function fail(field: string, expectation: string): never {
   throw new Error(`agent-hints: config${field} ${expectation}`)
@@ -129,15 +153,26 @@ function normalizeModels(raw: unknown, field: string): ModelCatalogEntry[] {
   })
 }
 
-/** Validate one raw config (patch-row `config` value) into runtime options; throws with a field path on shape violations. */
+/**
+ * Validate one raw config (patch-row `config` value) into runtime options.
+ * The config is a pure OVERRIDE layer: absent fields inherit the DSH host's
+ * endpoint/credential facts (`$DEEPSEEK_BASE_URL` → public API default;
+ * `DEEPSEEK_API_KEY` credential ref), so the plugin works with ZERO config.
+ * Provided-but-invalid values still throw with a field path.
+ */
 export function normalizeConfig(raw: unknown): PluginConfig {
-  if (raw === undefined || raw === null) fail('', 'is required: baseURL and apiKeyEnv must be provided')
-  if (typeof raw !== 'object' || Array.isArray(raw)) fail('', 'must be an object')
-  const record = raw as Record<string, unknown>
-  if (typeof record.baseURL !== 'string' || !/^https?:\/\//.test(record.baseURL)) {
+  const record: Record<string, unknown> = raw === undefined || raw === null
+    ? {}
+    : (() => {
+      if (typeof raw !== 'object' || Array.isArray(raw)) fail('', 'must be an object')
+      return raw as Record<string, unknown>
+    })()
+  const baseURL = record.baseURL === undefined ? inheritedBaseURL() : record.baseURL
+  if (typeof baseURL !== 'string' || !/^https?:\/\//.test(baseURL)) {
     fail('.baseURL', 'must be an http(s) URL')
   }
-  if (typeof record.apiKeyEnv !== 'string' || record.apiKeyEnv.length === 0) fail('.apiKeyEnv', 'must be a non-empty string')
+  const apiKeyEnv = record.apiKeyEnv === undefined ? inheritedApiKeyEnv() : record.apiKeyEnv
+  if (typeof apiKeyEnv !== 'string' || apiKeyEnv.length === 0) fail('.apiKeyEnv', 'must be a non-empty string')
   const agentType = record.agentType === undefined ? DEFAULT_AGENT_TYPE : record.agentType
   if (typeof agentType !== 'string' || agentType.length === 0) fail('.agentType', 'must be a non-empty string')
   if (record.thinking !== undefined && record.thinking !== 'enabled' && record.thinking !== 'disabled') {
@@ -157,8 +192,8 @@ export function normalizeConfig(raw: unknown): PluginConfig {
     fail('.defaultMaxTokens', 'must be a positive integer')
   }
   return {
-    baseURL: record.baseURL.replace(/\/+$/, ''),
-    apiKeyEnv: record.apiKeyEnv,
+    baseURL: baseURL.replace(/\/+$/, ''),
+    apiKeyEnv,
     agentType,
     priority: record.priority === undefined
       ? { ...DEFAULT_PRIORITY }
@@ -172,6 +207,8 @@ export function normalizeConfig(raw: unknown): PluginConfig {
     defaultContextWindow,
     defaultMaxTokens,
     statusSink: record.statusSink === undefined ? undefined : normalizeSinkPath(record.statusSink),
+    statusEndpoint: record.statusEndpoint === undefined ? undefined : normalizeEndpoint(record.statusEndpoint),
+    statusAuto: record.statusAuto === undefined ? false : normalizeBoolean(record.statusAuto),
     subagentToolNames: record.subagentToolNames === undefined
       ? ['subagent']
       : normalizeStringList(record.subagentToolNames, '.subagentToolNames'),
@@ -180,6 +217,16 @@ export function normalizeConfig(raw: unknown): PluginConfig {
 
 function normalizeSinkPath(raw: unknown): string {
   if (typeof raw !== 'string' || raw.length === 0) fail('.statusSink', 'must be a non-empty string')
+  return raw
+}
+
+function normalizeEndpoint(raw: unknown): string {
+  if (typeof raw !== 'string' || !/^https?:\/\//.test(raw)) fail('.statusEndpoint', 'must be an http(s) URL')
+  return raw
+}
+
+function normalizeBoolean(raw: unknown): boolean {
+  if (typeof raw !== 'boolean') fail('', 'boolean fields must be true or false')
   return raw
 }
 

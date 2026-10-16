@@ -1,8 +1,11 @@
 # Keyless wire-capture overlay for e2e/run.sh. The runner substitutes
-# __STUB_BASE_URL__ / __STATUS_SINK__ / __FIXTURE_TOOL__ before use. Two
+# __STUB_BASE_URL__ / __STATUS_SINK__ / __FIXTURE_TOOL__ before use. Three
 # operations in one overlay: mount the probe tool from source, then override
 # the agent-hints row config (raw pass-through to the plugin's apply — the
-# plugin exports no schemastery schema).
+# plugin exports no schemastery schema). `statusAuto: true` derives the status
+# endpoint from baseURL's origin (<origin>/agent-status, the Motor-coordinator
+# convention; the stub serves POST /agent-status) and composes with the JSONL
+# file sink.
 - insert:
     - id: dsh-agent-hints-e2e-probe
       name: __FIXTURE_TOOL__
@@ -11,3 +14,4 @@
     baseURL: __STUB_BASE_URL__
     apiKeyEnv: AGENT_HINTS_E2E_API_KEY
     statusSink: __STATUS_SINK__
+    statusAuto: true

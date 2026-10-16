@@ -5,7 +5,11 @@
 // text after the tool result arrives). Plain Node, zero dependencies — the
 // harness-side counterpart of packages/llm/llm-deepseek/tests/mock-server.ts.
 //
-// Usage: stub-server.mjs --capture <file.jsonl> [--port <n>] [--port-file <path>]
+// Also doubles as a status-endpoint receiver (`--status-out <file.jsonl>`):
+// POST /agent-status bodies are appended as JSONL lines, standing in for the
+// Motor Phase 4 scheduler endpoint in wire e2e runs.
+//
+// Usage: stub-server.mjs --capture <file.jsonl> [--port <n>] [--port-file <path>] [--status-out <file.jsonl>]
 import { appendFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 
@@ -20,6 +24,7 @@ if (capturePath === undefined) {
   process.exit(1)
 }
 const listenPort = Number(arg('port') ?? 0)
+const statusOutPath = arg('status-out')
 
 const server = createServer((request, response) => {
   const sse = (events) => {
@@ -29,6 +34,19 @@ const server = createServer((request, response) => {
   const chunks = []
   request.on('data', chunk => chunks.push(chunk))
   request.on('end', () => {
+    // Status endpoint: record the StatusEvent and acknowledge (no SSE script).
+    if (statusOutPath !== undefined && request.method === 'POST' && request.url === '/agent-status') {
+      const raw = Buffer.concat(chunks).toString('utf8')
+      try {
+        appendFileSync(statusOutPath, JSON.stringify(JSON.parse(raw)) + '\n')
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end('{"ok":true}')
+      } catch {
+        response.writeHead(400, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ error: { message: 'unparseable status event' } }))
+      }
+      return
+    }
     let body
     try {
       body = JSON.parse(Buffer.concat(chunks).toString('utf8'))

@@ -40,7 +40,7 @@ cd "$SCRATCH"
 echo "== agent-hints e2e scratch: $SCRATCH (DSH command: $DSH)"
 
 echo "== [1/5] start capture stub"
-node "$ROOT/e2e/stub-server.mjs" --capture "$SCRATCH/capture.jsonl" --port-file "$SCRATCH/stub.port" &
+node "$ROOT/e2e/stub-server.mjs" --capture "$SCRATCH/capture.jsonl" --port-file "$SCRATCH/stub.port" --status-out "$SCRATCH/status-http.jsonl" &
 STUB_PID=$!
 for _ in $(seq 1 50); do
   [ -f "$SCRATCH/stub.port" ] && break
@@ -81,6 +81,22 @@ grep -q 'AGENT_HINTS_E2E_FINAL' "$SCRATCH/run.jsonl"
 echo "  probe tool round trip completed (exit 0)"
 
 echo "== [5/5] assert captured request bodies"
-node "$ROOT/e2e/capture-check.mjs" "$SCRATCH/capture.jsonl" "$SCRATCH/status.jsonl"
+# The HTTP sink delivers asynchronously; wait for the finalize event to land.
+for _ in $(seq 1 50); do
+  [ -f "$SCRATCH/status-http.jsonl" ] && grep -q '"finalize"' "$SCRATCH/status-http.jsonl" 2> /dev/null && break
+  sleep 0.1
+done
+node "$ROOT/e2e/capture-check.mjs" "$SCRATCH/capture.jsonl" "$SCRATCH/status-http.jsonl"
+# Both sinks fire from the same emitter in emission order: the JSONL file and
+# the HTTP-received sequence must be identical.
+node -e "
+const fs = require('node:fs')
+const read = p => fs.readFileSync(p, 'utf8').trim().split('\n').filter(l => l.length > 0).map(JSON.parse)
+const file = read(process.argv[1])
+const http = read(process.argv[2])
+assert = require('node:assert/strict')
+assert.deepEqual(http, file, 'HTTP status events must match the file sink sequence')
+console.log('  file sink and HTTP endpoint sequences identical (' + http.length + ' events)')
+" "$SCRATCH/status.jsonl" "$SCRATCH/status-http.jsonl"
 
 echo "agent-hints e2e PASS"
