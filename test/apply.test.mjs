@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MulanPSL-2.0
 // Unit tests for the plugin wiring (index.apply): the firehose-derived
 // derivation.join, log-derived serving facts, and the status channel
 // activation — running against the committed built JS (lib/).

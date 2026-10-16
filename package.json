@@ -2,7 +2,7 @@
   "name": "dsh-agent-hints",
   "version": "0.2.0",
   "description": "Per-request serving-intent hints for DeepSeek Harness (dsh): an independent chat-completions provider route (deepseek-hint) carrying the X-Agent-Hint HTTP header (UTF-8 JSON, base64url) on every main-line model request",
-  "license": "Apache-2.0",
+  "license": "MulanPSL-2.0",
   "author": "evan7ang <the404notrain@gmail.com>",
   "repository": {
     "type": "git",

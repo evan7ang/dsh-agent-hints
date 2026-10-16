@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MulanPSL-2.0
 // Unit tests for the hint builder, the X-Agent-Hint header encoding, and the
 // durable serving-fact derivation, running against the committed built JS (lib/).
 import assert from 'node:assert/strict'

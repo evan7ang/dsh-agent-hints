@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MulanPSL-2.0
 // Unit tests for the hinted DeepSeek adapter: serialization, thinking
 // resolution, SSE decoding, chunk translation, HTTP error mapping, and the
 // header emission rules — running against the committed built JS (lib/).

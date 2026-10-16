@@ -121,4 +121,4 @@ The e2e resolves the `dsh` runtime from `DSH_BIN`, `PATH`, or a deepseek-harness
 
 ## License
 
-[Apache-2.0](LICENSE)
+[MulanPSL-2.0](LICENSE)

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MulanPSL-2.0
 /**
  * Out-of-band status event channel: the agent
  * framework reports lifecycle state transitions — `tool` (awaiting tool

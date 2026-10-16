@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MulanPSL-2.0
 /**
  * Plugin configuration normalization: raw patch-row config (plain JSON) into
  * validated runtime options. Invalid shapes fail at composition with a field

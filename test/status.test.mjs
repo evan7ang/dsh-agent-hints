@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MulanPSL-2.0
 // Unit tests for the out-of-band status channel: the pending-call state
 // machine (tool → running on the last parallel result), subagent naming and
 // child binding, finalize on session disposal, and the JSONL sink — running

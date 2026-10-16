@@ -121,4 +121,4 @@ e2e 的 `dsh` 运行时解析顺序：`DSH_BIN` > `PATH` > deepseek-harness chec
 
 ## License
 
-[Apache-2.0](LICENSE)
+[MulanPSL-2.0](LICENSE)

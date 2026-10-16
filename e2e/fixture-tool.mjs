@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MulanPSL-2.0
 // Minimal tool-provider fixture for the keyless wire e2e (run.sh): registers
 // one echo tool so the capture stub can drive a real tool round trip through
 // the hinted adapter. Plain JS, no build step — mounted straight from source
