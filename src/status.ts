@@ -34,6 +34,8 @@ export interface StatusEvent {
     reason?: string
     tools?: Array<{ name: string; call_id?: string; child_session_id?: string }>
   }
+  /** Pre-event estimate riding the same report (field definition §4: `expected_resume_s` accompanies `pause`/`suspend`). */
+  prediction?: { expected_resume_s?: number }
 }
 
 interface PendingCall {
@@ -126,6 +128,7 @@ export class StatusObserver {
   constructor(
     private readonly emit: (event: StatusEvent) => void,
     private readonly subagentToolNames: ReadonlySet<string>,
+    private readonly expectedResumeS?: number,
   ) {}
 
   /** Firehose entry: track pending tool calls, bind delegation children, and report completion. */
@@ -169,6 +172,25 @@ export class StatusObserver {
         agent_status: { state: 'finalize', state_since_ms: event.time },
       })
     }
+  }
+
+  /**
+   * Business-side `pause`/`suspend` report (human approval, external wait):
+   * emits the state event, carrying the configured `expected_resume_s` when
+   * one is set. The plugin has no in-repo trigger source — business callbacks
+   * (or a future harness pause trigger) call this seam; nothing calls it
+   * today, which keeps the pre-trigger wire behavior unchanged.
+   */
+  emitPause(sessionId: string, state: 'pause' | 'suspend', time: number, reason?: string): void {
+    this.emit({
+      session: { session_id: sessionId },
+      agent_status: {
+        state,
+        state_since_ms: time,
+        ...reason !== undefined ? { reason } : {},
+      },
+      ...this.expectedResumeS !== undefined ? { prediction: { expected_resume_s: this.expectedResumeS } } : {},
+    })
   }
 
   private pendingOf(sessionId: string): Map<string, PendingCall> {

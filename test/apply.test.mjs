@@ -180,6 +180,19 @@ test('status sink activates only when configured and records the session lifecyc
   }
 })
 
+test('prediction block: static source emits on main-line requests; absent source keeps the prior wire shape', async () => {
+  const { ctx, adapters } = fakeContext({ credentials: { resolve: async () => ({ value: 'sk-test' }) } })
+  apply(ctx, { baseURL: 'http://stub.local', apiKeyEnv: 'K', predictionStatic: { latency_ms: 4000, remaining_calls: 3 } })
+  const options = { provider: 'deepseek-hint', model: 'm', messages: [], sessionId: 's1' }
+  const withPrediction = JSON.parse(Buffer.from((await collect(adapters[0].stream(options))).headerCapture, 'base64url').toString('utf8'))
+  assert.deepEqual(withPrediction.prediction, { latency_ms: 4000, remaining_calls: 3 }, 'scalars only: next_action has no static semantics')
+
+  const { ctx: ctx2, adapters: adapters2 } = fakeContext({ credentials: { resolve: async () => ({ value: 'sk-test' }) } })
+  apply(ctx2, { baseURL: 'http://stub.local', apiKeyEnv: 'K' })
+  const without = JSON.parse(Buffer.from((await collect(adapters2[0].stream(options))).headerCapture, 'base64url').toString('utf8'))
+  assert.equal('prediction' in without, false, 'no prediction sources configured → block omitted')
+})
+
 test('statusAuto derives the HTTP endpoint from baseURL origin; explicit override wins; default off', async () => {
   const originalFetch = globalThis.fetch
   try {

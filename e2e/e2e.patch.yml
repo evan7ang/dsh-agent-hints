@@ -15,3 +15,7 @@
     apiKeyEnv: AGENT_HINTS_E2E_API_KEY
     statusSink: __STATUS_SINK__
     statusAuto: true
+    predictionStatic:
+      latency_ms: 4000
+      output_tokens: 512
+      remaining_calls: 3

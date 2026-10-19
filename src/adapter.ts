@@ -24,7 +24,7 @@ import type {
   HarnessToolSchema,
   HarnessTokenUsage,
 } from '@deepseek-ai/cordis'
-import { buildAgentHint, encodeAgentHintHeader, type HintOptions, type ServingFacts } from './hint.js'
+import { buildAgentHint, encodeAgentHintHeader, type AgentHintPrediction, type HintOptions, type ServingFacts } from './hint.js'
 import type { PluginConfig } from './config.js'
 
 /** Stable machine-routable failure with the harness error shape (`code` distinct from `message`, `cause` preserved). */
@@ -409,6 +409,8 @@ export interface HintedAdapterOptions {
   config: PluginConfig
   hintOptions: HintOptions
   servingFacts: ServingFactsLookup
+  /** Per-request `prediction` block resolution (trie + statics); `undefined` source omits the block. */
+  predictionFacts?: (sessionId: string) => AgentHintPrediction | undefined
   /** Parent's wait mode for the session's delegation, tracked from the firehose. */
   derivationJoin: (sessionId: string) => 'sync' | 'async' | undefined
   sessionHeader: SessionHeaderLookup
@@ -471,6 +473,7 @@ export class HintedDeepSeekAdapter {
         {
           sessionId: options.sessionId,
           ...this.options.servingFacts(options.sessionId),
+          prediction: this.options.predictionFacts?.(options.sessionId),
           parentSession: header?.parentSession,
           parentOrigin: header?.origin,
           derivationJoin: header?.parentSession !== undefined
@@ -487,7 +490,7 @@ export class HintedDeepSeekAdapter {
       'authorization': `Bearer ${await this.options.resolveApiKey()}`,
       'content-type': 'application/json',
       'accept': 'text/event-stream',
-      'user-agent': 'dsh-agent-hints/0.2 (+https://github.com/evan7ang/dsh-agent-hints)',
+      'user-agent': 'dsh-agent-hints/0.2.2 (+https://github.com/evan7ang/dsh-agent-hints)',
       // Identity/intent signals mirror the official adapter's conventions so
       // gateway consumers see the same transport metadata on this route.
       ...options.sessionId !== undefined

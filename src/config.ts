@@ -11,6 +11,7 @@
  */
 
 import type { AgentHintCacheControl, AgentHintPriority } from './hint.js'
+import type { PredictionStatic } from './prediction.js'
 
 /** One advisory catalog entry for `resolveModel`. */
 export interface ModelCatalogEntry {
@@ -48,6 +49,14 @@ export interface PluginConfig {
   statusEndpoint?: string
   /** Derive the status endpoint from `baseURL`'s origin (`<origin>/agent-status`, the Motor-coordinator convention) when no explicit `statusEndpoint` is set. */
   statusAuto?: boolean
+  /** Offline prediction trie file path (built by `scripts/build-prediction-trie.mjs`); enables the `prediction` hint block's distribution values. */
+  predictionTrie?: string
+  /** Static per-field fallbacks for the `prediction` block (dynamo `OptimizableField` analog); configuring this or `predictionTrie` turns the block on. */
+  predictionStatic?: PredictionStatic
+  /** Minimum node sample count for a trie distribution to be trusted over the static value. */
+  predictionMinSamples: number
+  /** Expected seconds until resume, carried on `pause`/`suspend` status events (business callbacks provide the trigger). */
+  expectedResumeS?: number
   /** Tool names treated as subagent delegation for `derivation.join` and `agent:<name>` status naming. */
   subagentToolNames: string[]
 }
@@ -71,6 +80,7 @@ const DEFAULT_REASONING_EFFORT = 'high'
 const DEFAULT_CONTEXT_WINDOW = 1_000_000
 const DEFAULT_MAX_TOKENS = 256_000
 const DEFAULT_API_KEY_ENV = 'DEEPSEEK_API_KEY'
+const DEFAULT_PREDICTION_MIN_SAMPLES = 5
 
 /**
  * The inherited endpoint chain, mirroring the official llm-deepseek adapter's
@@ -209,6 +219,10 @@ export function normalizeConfig(raw: unknown): PluginConfig {
     statusSink: record.statusSink === undefined ? undefined : normalizeSinkPath(record.statusSink),
     statusEndpoint: record.statusEndpoint === undefined ? undefined : normalizeEndpoint(record.statusEndpoint),
     statusAuto: record.statusAuto === undefined ? false : normalizeBoolean(record.statusAuto),
+    predictionTrie: record.predictionTrie === undefined ? undefined : normalizePath(record.predictionTrie, '.predictionTrie'),
+    predictionStatic: record.predictionStatic === undefined ? undefined : normalizePredictionStatic(record.predictionStatic),
+    predictionMinSamples: record.predictionMinSamples === undefined ? DEFAULT_PREDICTION_MIN_SAMPLES : normalizePositiveInteger(record.predictionMinSamples, '.predictionMinSamples'),
+    expectedResumeS: record.expectedResumeS === undefined ? undefined : normalizePositiveNumber(record.expectedResumeS, '.expectedResumeS'),
     subagentToolNames: record.subagentToolNames === undefined
       ? ['subagent']
       : normalizeStringList(record.subagentToolNames, '.subagentToolNames'),
@@ -217,6 +231,36 @@ export function normalizeConfig(raw: unknown): PluginConfig {
 
 function normalizeSinkPath(raw: unknown): string {
   if (typeof raw !== 'string' || raw.length === 0) fail('.statusSink', 'must be a non-empty string')
+  return raw
+}
+
+function normalizePath(raw: unknown, field: string): string {
+  if (typeof raw !== 'string' || raw.length === 0) fail(field, 'must be a non-empty string')
+  return raw
+}
+
+function normalizePredictionStatic(raw: unknown): PredictionStatic {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) fail('.predictionStatic', 'must be an object')
+  const record = raw as Record<string, unknown>
+  const normalized: PredictionStatic = {}
+  for (const field of ['latency_ms', 'remaining_calls', 'output_tokens', 'interval_ms', 'remaining_time_ms'] as const) {
+    const value = record[field]
+    if (value === undefined) continue
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      fail(`.predictionStatic.${field}`, 'must be a non-negative finite number')
+    }
+    normalized[field] = value
+  }
+  return normalized
+}
+
+function normalizePositiveInteger(raw: unknown, field: string): number {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) fail(field, 'must be a positive integer')
+  return raw
+}
+
+function normalizePositiveNumber(raw: unknown, field: string): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) fail(field, 'must be a positive number')
   return raw
 }
 

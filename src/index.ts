@@ -29,10 +29,11 @@
  */
 
 import type { Context, SessionLike, SessionEventLike } from '@deepseek-ai/cordis'
-import type { HintOptions, ServingFacts } from './hint.js'
+import type { AgentHintPrediction, HintOptions, ServingFacts } from './hint.js'
 import { deriveServingFacts } from './hint.js'
 import { HintedDeepSeekAdapter } from './adapter.js'
 import { normalizeConfig } from './config.js'
+import { loadPredictionTrie, resolvePredictionBlock, toolSequenceOf, type PredictionSource } from './prediction.js'
 import { HttpStatusSink, StatusObserver, appendStatusEvent, type StatusEvent } from './status.js'
 
 export const name = 'agent-hints'
@@ -87,6 +88,23 @@ export function apply(ctx: Context, config?: unknown): void {
     return { callIndex: next, epoch: 0 }
   }
 
+  // Prediction sources: the offline trie loads once at composition (any
+  // problem warns and degrades to statics); with neither source configured
+  // the block stays absent and the wire shape matches the pre-prediction
+  // plugin byte for byte.
+  const trie = pluginConfig.predictionTrie !== undefined
+    ? loadPredictionTrie(pluginConfig.predictionTrie, message => ctx.logger?.warn?.(message))
+    : undefined
+  const predictionSource: PredictionSource | undefined = trie !== undefined || pluginConfig.predictionStatic !== undefined
+    ? { trie, statics: pluginConfig.predictionStatic, minSamples: pluginConfig.predictionMinSamples }
+    : undefined
+  const predictionFacts = predictionSource === undefined
+    ? undefined
+    : (sessionId: string): AgentHintPrediction | undefined => {
+      const session = ctx.get('sessions')?.get(sessionId)
+      return resolvePredictionBlock(predictionSource, session === undefined ? [] : toolSequenceOf(session))
+    }
+
   ctx.on('session/event', (session: SessionLike, event: SessionEventLike) => {
     if (event.type === 'tool/call') {
       const toolName = event.data?.name
@@ -123,7 +141,7 @@ export function apply(ctx: Context, config?: unknown): void {
     }
     const observer = new StatusObserver(event => {
       for (const sink of sinks) sink(event)
-    }, subagentTools)
+    }, subagentTools, pluginConfig.expectedResumeS)
     ctx.on('session/event', (session: SessionLike, event: SessionEventLike) => observer.onEvent(session, event))
   }
 
@@ -142,6 +160,7 @@ export function apply(ctx: Context, config?: unknown): void {
     config: pluginConfig,
     hintOptions,
     servingFacts,
+    predictionFacts,
     derivationJoin: sessionId => delegationJoin.get(sessionId),
     sessionHeader: sessionId => ctx.get('sessions')?.get(sessionId)?.header,
     resolveApiKey,

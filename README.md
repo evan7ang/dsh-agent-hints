@@ -26,7 +26,7 @@ This differs from static header-injection approaches (e.g. wrapping `fetch` to s
 
 - **Main-line requests only**: auxiliary calls (`compaction`, `session-title` purposes) and requests without a session identity carry no hint.
 - `strict_priority` is **never sent** by an agent (trusted-control-plane field).
-- `prediction` is not sent in v1 (it requires an observation statistics engine).
+- `prediction` rides the same header when a source is configured (`predictionTrie` and/or `predictionStatic`); with no source configured the block is omitted and the wire shape is unchanged. Values come from an offline trie (longest tool-sequence-prefix match) with per-field static fallback.
 - Session identity mirrors the official adapter: `x-deepseek-harness-session-id` (when a session id exists) and `x-deepseek-harness-compact: 1` (on compaction) are sent as-is.
 
 ### The `X-Agent-Hint` payload
@@ -42,7 +42,11 @@ This differs from static header-injection approaches (e.g. wrapping `fetch` to s
   },
   "agent_status": { "state": "running", "state_since_ms": 1760000000000 },
   "priority": { "level": 3, "reason": "user_waiting" },          // configured; null omits
-  "cache_control": [{ "type": "pin", "range": { "end": 1 } }]    // configured; null omits
+  "cache_control": [{ "type": "pin", "range": { "end": 1 } }],   // configured; null omits
+  // "prediction": { "latency_ms": 8251, "remaining_calls": 2, "output_tokens": 640,
+  //   "interval_ms": 251, "remaining_time_ms": 42000,
+  //   "next_action": { "state": "tool", "tools": [{"name": "web_search", "expected_duration_s": 9}], "prob": 0.8 } }
+  //   — only when predictionTrie/predictionStatic is configured; trie miss falls back per field
 }
 ```
 
@@ -84,8 +88,8 @@ The API key resolves per request: credentials service first (`$DSH_HOME/.credent
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `baseURL` | string | — (required) | Upstream base; every chat request posts to `${baseURL}/chat/completions` |
-| `apiKeyEnv` | string | — (required) | Environment-variable name resolved per request |
+| `baseURL` | string | inherits `$DEEPSEEK_BASE_URL` → `https://api.deepseek.com` | Upstream base; every chat request posts to `${baseURL}/chat/completions` |
+| `apiKeyEnv` | string | inherits `$DEEPSEEK_API_KEY_ENV` → `DEEPSEEK_API_KEY` | Environment-variable name resolved per request (credentials service first) |
 | `agentType` | string | `agent` | Reported as `session.agent_type` |
 | `priority` | `{level, reason}` or `null` | `{level: 3, reason: "user_waiting"}` | Soft priority; `null` omits the field |
 | `cacheControl` | array or `null` | `[{type: "pin", range: {end: 1}}]` | Cache control entries; `null` omits |
@@ -94,7 +98,13 @@ The API key resolves per request: credentials service first (`$DSH_HOME/.credent
 | `models` | `{id, name, contextWindow, maxTokens}[]` | DeepSeek-V4 family catalog | Advisory model catalog for `resolveModel`; **provide real limits when pointing at your own gateway** (they feed compaction decisions) |
 | `defaultContextWindow` | positive integer | `1000000` | Context window assumed for models absent from the catalog |
 | `defaultMaxTokens` | positive integer | `256000` | Per-request output cap materialized when callers omit one |
-| `statusSink` | string | unset (channel off) | Local JSONL path for out-of-band status events |
+| `statusSink` | string | unset (file sink off) | Local JSONL path for out-of-band status events |
+| `statusEndpoint` | string | unset | Full status-event endpoint URL (Motor scheduler); overrides `statusAuto` |
+| `statusAuto` | boolean | `false` | Derive the status endpoint from `baseURL`'s origin (`<origin>/agent-status`) |
+| `predictionTrie` | string | unset (block off) | Offline prediction trie (built by `scripts/build-prediction-trie.mjs`); enables trie-sourced `prediction` values |
+| `predictionStatic` | object | unset | Static per-field fallbacks (`latency_ms`/`remaining_calls`/`output_tokens`/`interval_ms`/`remaining_time_ms`); configuring this or `predictionTrie` turns the `prediction` block on |
+| `predictionMinSamples` | positive integer | `5` | Minimum node sample count for a trie distribution to be trusted over the static value |
+| `expectedResumeS` | positive number | unset | Expected seconds until resume, carried on `pause`/`suspend` status events (business callbacks provide the trigger) |
 | `subagentToolNames` | string[] | `["subagent"]` | Tool names treated as subagent delegation for `derivation.join` and status naming |
 
 Invalid config aborts composition at load time with a field path — request-time hint construction has no failure path.

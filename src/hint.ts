@@ -56,6 +56,21 @@ export interface AgentHintCacheControl {
   }
 }
 
+/** `prediction` block: pre-event estimates for the serving engine (field definition §2.6); actual state is whatever the following `agent_status` reports. */
+export interface AgentHintPrediction {
+  latency_ms?: number
+  remaining_calls?: number
+  output_tokens?: number
+  interval_ms?: number
+  remaining_time_ms?: number
+  expected_resume_s?: number
+  next_action?: {
+    state: AgentHintAgentStatus['state']
+    tools?: Array<{ name: string; expected_duration_s?: number }>
+    prob?: number
+  }
+}
+
 /** The complete AgentHint object encoded into the `X-Agent-Hint` header value. */
 export interface AgentHint {
   session: AgentHintSession
@@ -63,19 +78,7 @@ export interface AgentHint {
   priority?: AgentHintPriority
   strict_priority?: AgentHintPriority
   cache_control?: AgentHintCacheControl | AgentHintCacheControl[]
-  prediction?: {
-    latency_ms?: number
-    remaining_calls?: number
-    output_tokens?: number
-    interval_ms?: number
-    remaining_time_ms?: number
-    expected_resume_s?: number
-    next_action?: {
-      state: AgentHintAgentStatus['state']
-      tools?: Array<{ name: string; expected_duration_s?: number }>
-      prob?: number
-    }
-  }
+  prediction?: AgentHintPrediction
 }
 
 /** Runtime facts for one request, gathered by the plugin from DSH services. */
@@ -94,6 +97,8 @@ export interface HintRequestFacts {
   parentOrigin?: string
   /** Parent's wait mode for this context, derived from the delegating tool call's `run_in_background`. */
   derivationJoin?: 'sync' | 'async'
+  /** Resolved `prediction` block for this request; `undefined` omits the block. */
+  prediction?: AgentHintPrediction
 }
 
 /** Static per-composition behavior; every field optional with a default. */
@@ -143,6 +148,7 @@ export function buildAgentHint(facts: HintRequestFacts, options: HintOptions, no
       ...entry.range !== undefined ? { range: { ...entry.range } } : {},
     }))
   }
+  if (facts.prediction !== undefined) hint.prediction = { ...facts.prediction }
   return hint
 }
 

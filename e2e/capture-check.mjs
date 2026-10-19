@@ -54,7 +54,12 @@ hintRequests.forEach((entry, index) => {
     fail(`request ${index}: cache_control must be [{type:"pin",range:{end:1}}], got ${JSON.stringify(hint.cache_control)}`)
   }
   if ('strict_priority' in hint) fail(`request ${index}: strict_priority must never be agent-sent`)
-  if ('prediction' in hint) fail(`request ${index}: prediction must not be sent in v1`)
+
+  // The e2e overlay configures `predictionStatic`: the block must be present
+  // with exactly the static scalars (no trie → no next_action).
+  if (JSON.stringify(hint.prediction) !== JSON.stringify({ latency_ms: 4000, output_tokens: 512, remaining_calls: 3 })) {
+    fail(`request ${index}: prediction must be the configured static block, got ${JSON.stringify(hint.prediction)}`)
+  }
 
   // Body stays in the provider's original format: no hint field anywhere.
   if (Object.hasOwn(entry.body, 'agent_hints')) {

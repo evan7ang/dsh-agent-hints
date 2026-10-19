@@ -88,6 +88,21 @@ test('appendStatusEvent writes protocol-shaped JSONL lines in order', () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('emitPause carries the configured expected_resume_s; the field is absent without one', () => {
+  const events = []
+  const observer = new StatusObserver(event => events.push(event), new Set(), 600)
+  observer.emitPause('s1', 'pause', 1000, 'human_approval')
+  assert.deepEqual(events, [{
+    session: { session_id: 's1' },
+    agent_status: { state: 'pause', state_since_ms: 1000, reason: 'human_approval' },
+    prediction: { expected_resume_s: 600 },
+  }])
+  const plain = []
+  const observer2 = new StatusObserver(event => plain.push(event), new Set())
+  observer2.emitPause('s1', 'suspend', 2000)
+  assert.deepEqual(plain, [{ session: { session_id: 's1' }, agent_status: { state: 'suspend', state_since_ms: 2000 } }])
+})
+
 const EVENT_A = { session: { session_id: 's1' }, agent_status: { state: 'tool', state_since_ms: 1 } }
 const EVENT_B = { session: { session_id: 's1' }, agent_status: { state: 'running', state_since_ms: 2 } }
 const EVENT_C = { session: { session_id: 's1' }, agent_status: { state: 'finalize', state_since_ms: 3 } }

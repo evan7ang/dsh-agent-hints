@@ -26,7 +26,7 @@ x-agent-hint: eyJzZXNzaW9uIjp7InNlc3Npb25faWQi…   ← UTF-8 JSON AgentHint 的
 
 - **仅主请求发射**：辅助调用（`compaction` / `session-title` purpose）与无会话身份的请求不加头。
 - `strict_priority` **永不发送**（可信控制面字段）。
-- `prediction` v1 不发送（需要观测统计引擎）。
+- `prediction` 在配置了来源时随同一头发射（`predictionTrie` 和/或 `predictionStatic`）；未配置来源时整块省略，wire 形状不变。取值来自离线 trie（工具序列最长前缀匹配），逐字段静态回退。
 - 身份信号与官方适配器对齐：`x-deepseek-harness-session-id`（有会话 id 时）与 `x-deepseek-harness-compact: 1`（compaction 时）照发。
 
 ### `X-Agent-Hint` 载荷
@@ -42,7 +42,11 @@ x-agent-hint: eyJzZXNzaW9uIjp7InNlc3Npb25faWQi…   ← UTF-8 JSON AgentHint 的
   },
   "agent_status": { "state": "running", "state_since_ms": 1760000000000 },
   "priority": { "level": 3, "reason": "user_waiting" },          // 配置项；null 省略
-  "cache_control": [{ "type": "pin", "range": { "end": 1 } }]    // 配置项；null 省略
+  "cache_control": [{ "type": "pin", "range": { "end": 1 } }],   // 配置项；null 省略
+  // "prediction": { "latency_ms": 8251, "remaining_calls": 2, "output_tokens": 640,
+  //   "interval_ms": 251, "remaining_time_ms": 42000,
+  //   "next_action": { "state": "tool", "tools": [{"name": "web_search", "expected_duration_s": 9}], "prob": 0.8 } }
+  //   — 仅在配置 predictionTrie/predictionStatic 时出现；trie 未命中逐字段回退静态值
 }
 ```
 
@@ -84,8 +88,8 @@ API key 逐请求解析：credentials 服务优先（`$DSH_HOME/.credentials.yam
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `baseURL` | string | —（必填） | 上游地址基座；每次请求 POST 到 `${baseURL}/chat/completions` |
-| `apiKeyEnv` | string | —（必填） | 逐请求解析的环境变量名 |
+| `baseURL` | string | 继承 `$DEEPSEEK_BASE_URL` → `https://api.deepseek.com` | 上游地址基座；每次请求 POST 到 `${baseURL}/chat/completions` |
+| `apiKeyEnv` | string | 继承 `$DEEPSEEK_API_KEY_ENV` → `DEEPSEEK_API_KEY` | 逐请求解析的环境变量名（credentials 服务优先） |
 | `agentType` | string | `agent` | 上报为 `session.agent_type` |
 | `priority` | `{level, reason}` 或 `null` | `{level: 3, reason: "user_waiting"}` | 软优先级；`null` 显式省略 |
 | `cacheControl` | 数组或 `null` | `[{type: "pin", range: {end: 1}}]` | 缓存控制条目；`null` 显式省略 |
@@ -94,7 +98,13 @@ API key 逐请求解析：credentials 服务优先（`$DSH_HOME/.credentials.yam
 | `models` | `{id, name, contextWindow, maxTokens}[]` | DeepSeek-V4 家族目录 | `resolveModel` 的咨询模型目录；**指向自有网关时必须提供真实限额**（供 compaction 决策使用） |
 | `defaultContextWindow` | 正整数 | `1000000` | 目录外模型假定的上下文窗口 |
 | `defaultMaxTokens` | 正整数 | `256000` | 调用方缺省时物化的单请求输出上限 |
-| `statusSink` | string | 未设（通道关闭） | 带外状态事件的本地 JSONL 路径 |
+| `statusSink` | string | 未设（文件 sink 关闭） | 带外状态事件的本地 JSONL 路径 |
+| `statusEndpoint` | string | 未设 | 状态事件端点全 URL（Motor 调度端）；优先于 `statusAuto` 推导 |
+| `statusAuto` | boolean | `false` | 从 `baseURL` 的 origin 推导状态端点（`<origin>/agent-status`） |
+| `predictionTrie` | string | 未设（prediction 块关闭） | 离线预测 trie（`scripts/build-prediction-trie.mjs` 构建）；启用 trie 来源的 `prediction` 取值 |
+| `predictionStatic` | 对象 | 未设 | 逐字段静态回退（`latency_ms`/`remaining_calls`/`output_tokens`/`interval_ms`/`remaining_time_ms`）；配置本项或 `predictionTrie` 即开启 `prediction` 块 |
+| `predictionMinSamples` | 正整数 | `5` | trie 节点分布被采信所需的最低样本数（低于则回退静态值） |
+| `expectedResumeS` | 正数 | 未设 | 预计恢复秒数，随 `pause`/`suspend` 状态事件携带（触发源由业务回调提供） |
 | `subagentToolNames` | string[] | `["subagent"]` | 视为子 agent 委派的工具名（用于 `derivation.join` 与状态命名） |
 
 配置在装载阶段严格校验，非法即组合失败并带字段路径——请求期 hint 构造没有失败路径。
