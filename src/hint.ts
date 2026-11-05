@@ -29,13 +29,17 @@ export interface AgentHintSession {
   epoch: number
 }
 
-/** `agent_status` block: the framework-reported lifecycle state. */
+/**
+ * `agent_status` block as carried on the request header: the four-value
+ * lifecycle contract, and ONLY `state` + `state_since_ms` (diagnostic fields
+ * stay on the out-of-band event channel). DSH never sends `finalize` on the
+ * header — a completed run has no closing request — so it rides the
+ * `turn/end(completed)` status event instead.
+ */
 export interface AgentHintAgentStatus {
-  state: 'running' | 'tool' | 'pause' | 'suspend' | 'finalize'
+  state: 'running' | 'pause' | 'resume' | 'finalize'
   /** Unix epoch milliseconds when the current state was entered. */
   state_since_ms: number
-  reason?: string
-  tools?: Array<{ name: string; call_id?: string; child_session_id?: string }>
 }
 
 /** `priority` / `strict_priority` block. `strict_priority` is never sent by an agent: it is reserved for a trusted control plane. */
@@ -56,7 +60,12 @@ export interface AgentHintCacheControl {
   }
 }
 
-/** `prediction` block: pre-event estimates for the serving engine (field definition §2.6); actual state is whatever the following `agent_status` reports. */
+/**
+ * `prediction` block: pre-event estimates for the serving engine (field
+ * definition §2.6); actual state is whatever the following `agent_status`
+ * reports. The prediction family is unchanged by the four-value convergence —
+ * its `next_action.state` keeps the full protocol vocabulary.
+ */
 export interface AgentHintPrediction {
   latency_ms?: number
   remaining_calls?: number
@@ -65,7 +74,7 @@ export interface AgentHintPrediction {
   remaining_time_ms?: number
   expected_resume_s?: number
   next_action?: {
-    state: AgentHintAgentStatus['state']
+    state: 'running' | 'tool' | 'pause' | 'suspend' | 'finalize'
     tools?: Array<{ name: string; expected_duration_s?: number }>
     prob?: number
   }
@@ -89,36 +98,38 @@ export interface HintRequestFacts {
   callIndex: number
   /** Per-session context version. */
   epoch: number
-  /** When the session last entered `running` (latest tool/result), if observed. */
-  runningSinceMs?: number
+  /** Request-time lifecycle state (DSH never sends `finalize` on the header). */
+  state: 'running' | 'pause' | 'resume'
+  /** When the current state was entered; `undefined` for `running` with no observed entry (falls back to the request time). */
+  stateSinceMs?: number
   /** Parent session id from the live session header, when resolvable. */
   parentSession?: string
   /** `origin` from the live session header (`'subagent'` under delegation). */
   parentOrigin?: string
   /** Parent's wait mode for this context, derived from the delegating tool call's `run_in_background`. */
   derivationJoin?: 'sync' | 'async'
+  /** Per-request soft priority (dynamic two-level or a static override); `undefined` omits the field. */
+  priority?: AgentHintPriority
+  /** Per-request cache control entries; `undefined` omits the field. */
+  cacheControl?: AgentHintCacheControl[]
   /** Resolved `prediction` block for this request; `undefined` omits the block. */
   prediction?: AgentHintPrediction
 }
 
-/** Static per-composition behavior; every field optional with a default. */
+/** Static per-composition behavior. */
 export interface HintOptions {
   /** Agent type identifier reported in `session.agent_type`. */
   agentType: string
-  /** Soft priority; `undefined` omits the field. */
-  priority?: AgentHintPriority
-  /** Cache control entries; `undefined` omits the field. */
-  cacheControl?: AgentHintCacheControl[]
 }
 
 /**
- * Build one AgentHint for a main-line model request. The request-time state is
- * always `running` (a request is only prepared while the agent generates), so
- * the hint carries the tracked transition instant rather than a tool state:
- * serving-side consumers read it as "this request is interactive work".
+ * Build one AgentHint for a main-line model request. Status and intent come
+ * from the per-request facts: the status is the tracked four-value state, the
+ * priority is the dynamic two-level value (or a static override), and cache
+ * control is the derived single ephemeral declaration.
  * @param facts - runtime facts gathered for this request.
  * @param options - static composition behavior.
- * @param nowMs - wall clock for the unobserved `state_since_ms` fallback.
+ * @param nowMs - wall clock for an unobserved `state_since_ms` fallback.
  */
 export function buildAgentHint(facts: HintRequestFacts, options: HintOptions, nowMs: number): AgentHint {
   const session: AgentHintSession = {
@@ -137,13 +148,13 @@ export function buildAgentHint(facts: HintRequestFacts, options: HintOptions, no
   const hint: AgentHint = {
     session,
     agent_status: {
-      state: 'running',
-      state_since_ms: facts.runningSinceMs ?? nowMs,
+      state: facts.state,
+      state_since_ms: facts.stateSinceMs ?? nowMs,
     },
   }
-  if (options.priority !== undefined) hint.priority = { ...options.priority }
-  if (options.cacheControl !== undefined) {
-    hint.cache_control = options.cacheControl.map(entry => ({
+  if (facts.priority !== undefined) hint.priority = { ...facts.priority }
+  if (facts.cacheControl !== undefined) {
+    hint.cache_control = facts.cacheControl.map(entry => ({
       ...entry,
       ...entry.range !== undefined ? { range: { ...entry.range } } : {},
     }))
@@ -166,35 +177,152 @@ export function encodeAgentHintHeader(hint: AgentHint): string {
  * Durable serving-fact derivation from the session event log
  * ------------------------------------------------------------------ */
 
-/** The minimal session-log view the derivation reads (structural `Session.ownEvents`). */
-export interface DerivationSession {
-  ownEvents(): Array<{ type: string; time: number }>
+/** One session-log event view the derivation reads (structural `Session.ownEvents`). */
+export interface DerivationEvent {
+  type: string
+  time: number
+  data?: {
+    /** `tool/call`: provider-issued call id pairing call with result. */
+    callId?: unknown
+    /** `tool/result`: the result message whose content blocks carry the settled `toolCallId`. */
+    message?: { content?: Array<{ type?: unknown; toolCallId?: unknown }> }
+  }
 }
 
-/** Serving facts derived from the durable event log; all three survive process restarts (the log replays on restore). */
+/** The minimal session-log view the derivation reads. */
+export interface DerivationSession {
+  ownEvents(): DerivationEvent[]
+}
+
+/** Serving facts derived from the durable event log; all survive process restarts (the log replays on restore). */
 export interface ServingFacts {
   /** Main-line model calls so far, INCLUDING the current one: `step/start` is appended before each dispatch, so the count is the ordinal of the in-flight call. Auxiliary calls (compaction/session-title) run outside loop steps and never append `step/start`. */
   callIndex: number
   /** Context version: completions of compaction rewrites. */
   epoch: number
-  /** When the session last entered `running` (latest tool/result), if the log has one. */
-  runningSinceMs?: number
+  /** Request-time lifecycle state (four-value contract minus `finalize`, which never rides the header in DSH). */
+  state: 'running' | 'pause' | 'resume'
+  /** When the current state was entered; `undefined` for `running` with no observed entry (request time fallback). */
+  stateSinceMs?: number
+  /** True when the in-flight call is the first of its turn — the user-intervention signal for the two-level priority. */
+  turnOpening: boolean
+  /** Last response-end → this request-start gap, when observed (the cache TTL source). */
+  intervalMs?: number
+  /** A compaction rewrite completed between the previous and the current main-line call (suppresses cache declarations for that round). */
+  afterCompaction: boolean
+}
+
+function resultCallId(event: DerivationEvent): string | undefined {
+  const block = event.data?.message?.content?.find(candidate => candidate?.type === 'tool-result')
+  const id = block?.toolCallId
+  return typeof id === 'string' ? id : undefined
 }
 
 /**
  * Derive per-request serving facts from the session's own event log — the
- * durable, restart-safe basis (restored sessions replay their log, so counts
- * resume instead of resetting). Replaces the v2 in-memory `SessionTrack`.
+ * durable, restart-safe basis (restored sessions replay their log).
+ *
+ * Lifecycle state (per the handoff contract): an unpaired `tool/call` means
+ * the agent is paused awaiting the tool; the first call after the pending set
+ * last emptied is `resume`; everything else is `running`. Any `turn/end`
+ * closes the resume window (the next turn opens as `running`).
+ *
+ * Priority signal: `turnOpening` is the first call after the latest
+ * `turn/start` (falling back to `callIndex === 1` when the log has no turn
+ * boundary events).
+ *
+ * Cache signals: `intervalMs` is the previous response end (`step/end`) to
+ * this request start; `afterCompaction` flags a rewrite between the previous
+ * and the current call.
  * @param session - the live session handle (structural `Session`).
  */
 export function deriveServingFacts(session: DerivationSession): ServingFacts {
   let callIndex = 0
   let epoch = 0
-  let runningSinceMs: number | undefined
+  const pending = new Map<string, number>()
+  let pauseSinceMs: number | undefined
+  let releaseAt: number | undefined
+  let stepsAfterRelease = 0
+  let turnEndAfterRelease = false
+  let latestTurnStartAt: number | undefined
+  let turnStartSeen = false
+  let stepsSinceTurnStart = 0
+  let lastStepStartAt: number | undefined
+  let lastStepEndAt: number | undefined
+  let stepEndBeforeLastStepStart: number | undefined
+  let lastCompactionAt: number | undefined
+
   for (const event of session.ownEvents()) {
-    if (event.type === 'step/start') callIndex += 1
-    else if (event.type === 'compaction/end') epoch += 1
-    else if (event.type === 'tool/result') runningSinceMs = event.time
+    switch (event.type) {
+      case 'turn/start':
+        turnStartSeen = true
+        latestTurnStartAt = event.time
+        stepsSinceTurnStart = 0
+        break
+      case 'step/start':
+        callIndex += 1
+        stepsSinceTurnStart += 1
+        stepsAfterRelease += 1
+        lastStepStartAt = event.time
+        stepEndBeforeLastStepStart = lastStepEndAt
+        break
+      case 'step/end':
+        lastStepEndAt = event.time
+        break
+      case 'compaction/end':
+        epoch += 1
+        lastCompactionAt = event.time
+        break
+      case 'tool/call': {
+        const callId = typeof event.data?.callId === 'string' ? event.data.callId : undefined
+        if (callId !== undefined) {
+          if (pending.size === 0) pauseSinceMs = event.time
+          pending.set(callId, event.time)
+        }
+        break
+      }
+      case 'tool/result': {
+        const callId = resultCallId(event)
+        if (callId !== undefined && pending.delete(callId) && pending.size === 0) {
+          pauseSinceMs = undefined
+          releaseAt = event.time
+          stepsAfterRelease = 0
+          turnEndAfterRelease = false
+        }
+        break
+      }
+      case 'turn/end':
+        pending.clear()
+        pauseSinceMs = undefined
+        turnEndAfterRelease = true
+        break
+    }
   }
-  return { callIndex, epoch, runningSinceMs }
+
+  let state: ServingFacts['state']
+  let stateSinceMs: number | undefined
+  if (pending.size > 0) {
+    state = 'pause'
+    stateSinceMs = pauseSinceMs
+  } else if (releaseAt !== undefined && !turnEndAfterRelease && stepsAfterRelease === 1) {
+    state = 'resume'
+    stateSinceMs = releaseAt
+  } else {
+    state = 'running'
+    stateSinceMs = latestTurnStartAt !== undefined && releaseAt !== undefined
+      ? Math.max(latestTurnStartAt, releaseAt)
+      : latestTurnStartAt ?? releaseAt
+  }
+
+  const turnOpening = turnStartSeen ? stepsSinceTurnStart === 1 : callIndex === 1
+  const intervalMs = lastStepStartAt !== undefined && stepEndBeforeLastStepStart !== undefined
+    && lastStepStartAt > stepEndBeforeLastStepStart
+    ? lastStepStartAt - stepEndBeforeLastStepStart
+    : undefined
+  // A compaction rewrite after the previous response end (between steps, or
+  // mid-step for an overflow-recovery retry) changed the prefix this round.
+  const afterCompaction = lastCompactionAt !== undefined
+    && lastCompactionAt > (stepEndBeforeLastStepStart ?? Number.NEGATIVE_INFINITY)
+
+  return { callIndex, epoch, state, stateSinceMs, turnOpening, intervalMs, afterCompaction }
 }

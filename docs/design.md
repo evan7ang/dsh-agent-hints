@@ -103,6 +103,7 @@ The hint lives in an HTTP header — model-invisible and absent from the durable
 
 ## 6. Known limits and future items
 
+- **Superseded (2026-11-04)**: the four-value `agent_status`, two-level dynamic `priority`, and dynamic `cache_control` designs in [20261104-01](design/20261104-01-simplified-scenario-fields.md) supersede the five-value state, static priority, and `pin` defaults described here.
 - **Protocol subset**: v1 is chat-completions only — text + tools + thinking + usage + abort; images/files are rejected explicitly; the messages protocol and image representation are future items. The subset must be kept in sync with the official adapter manually (the deployment target is a self-hosted gateway, so the subset is under control).
 - **Route coexistence**: `deepseek-hint` coexists with the official `deepseek-official`; switching the provider by mistake silently drops hints — the e2e wire assertions are the safety net.
 - `call_index`/`epoch`/`runningSinceMs` derive from the session log (restore replays), continuing across restarts; they depend on harness event semantics (`step/start` precedes dispatch, auxiliary calls do not enter a loop step) and must follow its evolution.

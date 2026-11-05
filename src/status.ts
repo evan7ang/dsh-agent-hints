@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 /**
  * Out-of-band status event channel: the agent
- * framework reports lifecycle state transitions — `tool` (awaiting tool
- * executions), `running` (back to generation), `finalize` (task completion) — as
- * state events, separate from the per-request `X-Agent-Hint` header.
+ * framework reports lifecycle state transitions — `pause` (awaiting tool
+ * executions; every tool call counts as "waiting on something external"),
+ * `running` (back to generation), `finalize` (task completion) — as state
+ * events, separate from the per-request `X-Agent-Hint` header.
+ *
+ * The four-value contract folds `tool` into `pause` at the sender, so no
+ * `tool` state ever reaches the wire; diagnostics (`reason`, `tools[]`,
+ * `child_session_id`) ride the event channel only.
  *
  * v1 sinks: a local JSONL file (append-only, per-emission order) and an HTTP
  * endpoint sink (`HttpStatusSink`, the scheduler/Motor status endpoint) — both
@@ -14,10 +19,11 @@
  * policy).
  *
  * Parallel tool calls: `running` is reported only when the LAST pending call
- * settles; every `tool/call` re-reports the full pending
- * set. Subagent delegation: pending entries for delegation tools are named
- * `agent:<toolName>` and gain `child_session_id` when the child session first
- * surfaces on the firehose (FIFO binding to the oldest unbound entry).
+ * settles; every `tool/call` re-reports the full pending set, with
+ * `state_since_ms` pinned to when the pause episode began. Subagent
+ * delegation: pending entries for delegation tools are named `agent:<toolName>`
+ * and gain `child_session_id` when the child session first surfaces on the
+ * firehose (FIFO binding to the oldest unbound entry).
  *
  * @module dsh-agent-hints/status
  */
@@ -25,17 +31,15 @@
 import { appendFileSync } from 'node:fs'
 import type { SessionEventLike, SessionLike } from '@deepseek-ai/cordis'
 
-/** One wire status event. */
+/** One wire status event (the event channel carries the folded four-value vocabulary minus `resume`, which is request-scoped). */
 export interface StatusEvent {
   session: { session_id: string }
   agent_status: {
-    state: 'running' | 'tool' | 'pause' | 'suspend' | 'finalize'
+    state: 'running' | 'pause' | 'finalize'
     state_since_ms: number
     reason?: string
     tools?: Array<{ name: string; call_id?: string; child_session_id?: string }>
   }
-  /** Pre-event estimate riding the same report (field definition §4: `expected_resume_s` accompanies `pause`/`suspend`). */
-  prediction?: { expected_resume_s?: number }
 }
 
 interface PendingCall {
@@ -124,11 +128,12 @@ export class HttpStatusSink {
  */
 export class StatusObserver {
   private readonly pending = new Map<string, Map<string, PendingCall>>()
+  /** When each session's current pause episode began (the empty → non-empty pending transition). */
+  private readonly pauseSince = new Map<string, number>()
 
   constructor(
     private readonly emit: (event: StatusEvent) => void,
     private readonly subagentToolNames: ReadonlySet<string>,
-    private readonly expectedResumeS?: number,
   ) {}
 
   /** Firehose entry: track pending tool calls, bind delegation children, and report completion. */
@@ -142,9 +147,10 @@ export class StatusObserver {
       const name = event.data?.name
       if (callId === undefined || name === undefined) return
       const calls = this.pendingOf(session.id)
+      if (calls.size === 0) this.pauseSince.set(session.id, event.time)
       const displayName = this.subagentToolNames.has(name) ? `agent:${name}` : name
       calls.set(callId, { name: displayName })
-      this.reportTool(session.id, event.time)
+      this.reportPause(session.id)
       return
     }
     if (event.type === 'tool/result') {
@@ -155,6 +161,7 @@ export class StatusObserver {
       if (calls.size === 0) {
         // Parallel tools: report `running` only when the LAST result settles.
         this.pending.delete(session.id)
+        this.pauseSince.delete(session.id)
         this.emit({
           session: { session_id: session.id },
           agent_status: { state: 'running', state_since_ms: event.time },
@@ -162,35 +169,18 @@ export class StatusObserver {
       }
       return
     }
-    if (event.type === 'turn/end' && event.data?.reason?.kind === 'completed') {
-      // Business-side completion verdict for one-shot headless tasks: a
-      // completed turn means the task finished. DSH's
-      // `agent/status` `idle` is NOT mapped (protocol finalize ≠ idle).
+    if (event.type === 'turn/end') {
+      // A finished turn cannot leave live tool waits behind; only a completed
+      // turn is a task completion (DSH's `agent/status` `idle` is NOT finalize).
       this.pending.delete(session.id)
-      this.emit({
-        session: { session_id: session.id },
-        agent_status: { state: 'finalize', state_since_ms: event.time },
-      })
+      this.pauseSince.delete(session.id)
+      if (event.data?.reason?.kind === 'completed') {
+        this.emit({
+          session: { session_id: session.id },
+          agent_status: { state: 'finalize', state_since_ms: event.time },
+        })
+      }
     }
-  }
-
-  /**
-   * Business-side `pause`/`suspend` report (human approval, external wait):
-   * emits the state event, carrying the configured `expected_resume_s` when
-   * one is set. The plugin has no in-repo trigger source — business callbacks
-   * (or a future harness pause trigger) call this seam; nothing calls it
-   * today, which keeps the pre-trigger wire behavior unchanged.
-   */
-  emitPause(sessionId: string, state: 'pause' | 'suspend', time: number, reason?: string): void {
-    this.emit({
-      session: { session_id: sessionId },
-      agent_status: {
-        state,
-        state_since_ms: time,
-        ...reason !== undefined ? { reason } : {},
-      },
-      ...this.expectedResumeS !== undefined ? { prediction: { expected_resume_s: this.expectedResumeS } } : {},
-    })
   }
 
   private pendingOf(sessionId: string): Map<string, PendingCall> {
@@ -201,16 +191,19 @@ export class StatusObserver {
     return created
   }
 
-  private reportTool(sessionId: string, time: number): void {
+  /** Report the pause episode: state pinned to when the episode began. */
+  private reportPause(sessionId: string): void {
     const calls = this.pending.get(sessionId)
-    if (calls === undefined || calls.size === 0) return
+    const since = this.pauseSince.get(sessionId)
+    if (calls === undefined || calls.size === 0 || since === undefined) return
+    const entries = [...calls.entries()]
     this.emit({
       session: { session_id: sessionId },
       agent_status: {
-        state: 'tool',
-        state_since_ms: time,
+        state: 'pause',
+        state_since_ms: since,
         reason: 'await_tool',
-        tools: [...calls.entries()].map(([callId, entry]) => ({
+        tools: entries.map(([callId, entry]) => ({
           name: entry.name,
           call_id: callId,
           ...entry.childSessionId !== undefined ? { child_session_id: entry.childSessionId } : {},
@@ -225,7 +218,7 @@ export class StatusObserver {
     for (const entry of calls.values()) {
       if (!entry.name.startsWith('agent:') || entry.childSessionId !== undefined) continue
       entry.childSessionId = childSessionId
-      this.reportTool(parentSessionId, Date.now())
+      this.reportPause(parentSessionId)
       return
     }
   }

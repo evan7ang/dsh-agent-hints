@@ -1,0 +1,12 @@
+# Keyless wire-capture overlay for the compaction/epoch phase of e2e/run.sh.
+# The runner substitutes __STUB_BASE_URL__ / __STATUS_SINK__ / __FIXTURE_TOOL__.
+# A second stub process serves this phase so its capture and status stream stay
+# isolated from the delegation run's assertions.
+- insert:
+    - id: dsh-agent-hints-e2e-probe
+      name: __FIXTURE_TOOL__
+- id: agent-hints
+  config:
+    baseURL: __STUB_BASE_URL__
+    apiKeyEnv: AGENT_HINTS_E2E_API_KEY
+    statusSink: __STATUS_SINK__

@@ -7,11 +7,10 @@ import { test } from 'node:test'
 
 import { serializeRequest, resolveThinking, parseSse, translate, HintedDeepSeekAdapter, AdapterError } from '../lib/adapter.js'
 import { normalizeConfig } from '../lib/config.js'
-import { buildAgentHint } from '../lib/hint.js'
 
 const CONFIG = normalizeConfig({ baseURL: 'http://stub.local', apiKeyEnv: 'TEST_KEY' })
 
-const OPTIONS = { agentType: 'agent', priority: { level: 3, reason: 'user_waiting' }, cacheControl: [{ type: 'pin', range: { end: 1 } }] }
+const OPTIONS = { agentType: 'agent' }
 
 function message(role, content, extra = {}) {
   return { id: `m-${Math.random()}`, role, content, source: { kind: 'plugin' }, ...extra }
@@ -181,11 +180,22 @@ test('translate maps a degenerate stop with no blocks to EMPTY_RESPONSE', async 
 
 function makeAdapter(overrides = {}) {
   let nextCall = 0
-  const servingFacts = () => ({ callIndex: ++nextCall, epoch: 0, runningSinceMs: 111 })
+  const servingFacts = () => ({
+    callIndex: ++nextCall,
+    epoch: 0,
+    state: 'running',
+    stateSinceMs: 111,
+    turnOpening: nextCall === 1,
+    intervalMs: undefined,
+    afterCompaction: false,
+  })
   const adapter = new HintedDeepSeekAdapter({
     config: CONFIG,
     hintOptions: OPTIONS,
     servingFacts,
+    priorityOf: facts => facts.turnOpening
+      ? { level: 3, reason: 'user_waiting' }
+      : { level: 1, reason: 'critical_path' },
     derivationJoin: () => undefined,
     sessionHeader: sessionId => sessionId === 'child' ? { parentSession: 'root', origin: 'subagent' } : undefined,
     resolveApiKey: async () => 'sk-test',
@@ -225,7 +235,12 @@ test('stream adds the X-Agent-Hint header on main-line requests only, with a cle
     assert.equal(main.url, 'http://stub.local/chat/completions')
     assert.equal(typeof main.init.headers['x-agent-hint'], 'string')
     const hint = JSON.parse(Buffer.from(main.init.headers['x-agent-hint'], 'base64url').toString('utf8'))
-    assert.deepEqual(hint, buildAgentHint({ sessionId: 's1', callIndex: 1, epoch: 0, runningSinceMs: 111 }, OPTIONS, hint.agent_status.state_since_ms))
+    assert.equal(hint.session.call_index, 1)
+    assert.equal(hint.agent_status.state, 'running')
+    assert.equal(hint.agent_status.state_since_ms, 111)
+    assert.deepEqual(Object.keys(hint.agent_status).sort(), ['state', 'state_since_ms'], 'the header carries only the two status keys')
+    assert.deepEqual(hint.priority, { level: 3, reason: 'user_waiting' })
+    assert.equal('cache_control' in hint, false, 'a short prefix (< 128 tokens) is not declared')
     assert.equal('agent_hints' in JSON.parse(main.init.body), false)
     assert.equal('x-agent-hint' in title.init.headers, false)
     assert.equal('x-agent-hint' in anonymous.init.headers, false)
@@ -257,6 +272,109 @@ test('stream hint picks up parent lineage and increments call_index across reque
   }
 })
 
+function hintCapturingFetch() {
+  const captured = []
+  const original = globalThis.fetch
+  globalThis.fetch = async (_url, init) => {
+    captured.push({ headers: init.headers, body: JSON.parse(init.body) })
+    return okResponse(['{"choices":[{"delta":{"content":"x"}}]}', '{"choices":[{"delta":{},"finish_reason":"stop"}]}', '[DONE]'])
+  }
+  return { captured, restore: () => { globalThis.fetch = original } }
+}
+
+function decodeHint(entry) {
+  return JSON.parse(Buffer.from(entry.headers['x-agent-hint'], 'base64url').toString('utf8'))
+}
+
+const LONG_MESSAGES = [message('user', [textBlock('中'.repeat(200))])]
+
+test('dynamic cache_control declares one ephemeral entry sized to the wire prefix', async () => {
+  const fetchCapture = hintCapturingFetch()
+  try {
+    const { adapter } = makeAdapter()
+    await collect(adapter.stream({ ...MAIN_OPTIONS, sessionId: 's1', messages: LONG_MESSAGES }))
+    const hint = decodeHint(fetchCapture.captured[0])
+    assert.deepEqual(hint.cache_control, [{
+      type: 'ephemeral',
+      ttl_s: 600,
+      range: { end: fetchCapture.captured[0].body.messages.length, unit: 'message' },
+    }])
+  } finally {
+    fetchCapture.restore()
+  }
+})
+
+test('cache TTL follows the interval sample; a model change suppresses exactly that round', async () => {
+  const fetchCapture = hintCapturingFetch()
+  try {
+    let call = 0
+    const { adapter } = makeAdapter({
+      servingFacts: () => ({
+        callIndex: ++call,
+        epoch: 0,
+        state: 'running',
+        stateSinceMs: 1,
+        turnOpening: call === 1,
+        intervalMs: 120_000,
+        afterCompaction: false,
+      }),
+    })
+    await collect(adapter.stream({ ...MAIN_OPTIONS, sessionId: 's1', messages: LONG_MESSAGES }))
+    await collect(adapter.stream({ ...MAIN_OPTIONS, sessionId: 's1', messages: LONG_MESSAGES }))
+    assert.equal(decodeHint(fetchCapture.captured[0]).cache_control[0].ttl_s, 240, '120 s gap → 240 s TTL')
+    assert.equal(decodeHint(fetchCapture.captured[1]).cache_control[0].ttl_s, 240, 'the same signature keeps declaring')
+
+    await collect(adapter.stream({ ...MAIN_OPTIONS, model: 'other-model', sessionId: 's1', messages: LONG_MESSAGES }))
+    assert.equal('cache_control' in decodeHint(fetchCapture.captured[2]), false, 'a model change suppresses the round')
+    await collect(adapter.stream({ ...MAIN_OPTIONS, model: 'other-model', sessionId: 's1', messages: LONG_MESSAGES }))
+    assert.equal(decodeHint(fetchCapture.captured[3]).cache_control[0].ttl_s, 240, 'the new signature stabilises')
+  } finally {
+    fetchCapture.restore()
+  }
+})
+
+test('a compaction rewrite suppresses the declaration for that round', async () => {
+  const fetchCapture = hintCapturingFetch()
+  try {
+    const { adapter } = makeAdapter({
+      servingFacts: () => ({
+        callIndex: 1,
+        epoch: 1,
+        state: 'running',
+        stateSinceMs: 1,
+        turnOpening: true,
+        intervalMs: undefined,
+        afterCompaction: true,
+      }),
+    })
+    await collect(adapter.stream({ ...MAIN_OPTIONS, sessionId: 's1', messages: LONG_MESSAGES }))
+    assert.equal('cache_control' in decodeHint(fetchCapture.captured[0]), false)
+  } finally {
+    fetchCapture.restore()
+  }
+})
+
+test('static cacheControl is sent verbatim; null omits the field', async () => {
+  const fetchCapture = hintCapturingFetch()
+  try {
+    const staticConfig = normalizeConfig({
+      baseURL: 'http://stub.local',
+      apiKeyEnv: 'K',
+      cacheControl: [{ type: 'ephemeral', ttl_s: 120 }],
+    })
+    const { adapter } = makeAdapter({ config: staticConfig })
+    await collect(adapter.stream({ ...MAIN_OPTIONS, sessionId: 's1', messages: LONG_MESSAGES }))
+    assert.deepEqual(decodeHint(fetchCapture.captured[0]).cache_control, [{ type: 'ephemeral', ttl_s: 120 }])
+
+    const omitConfig = normalizeConfig({ baseURL: 'http://stub.local', apiKeyEnv: 'K', cacheControl: null })
+    const { adapter: omitted } = makeAdapter({ config: omitConfig })
+    await collect(omitted.stream({ ...MAIN_OPTIONS, sessionId: 's2', messages: LONG_MESSAGES }))
+    assert.equal('cache_control' in decodeHint(fetchCapture.captured[1]), false)
+  } finally {
+    fetchCapture.restore()
+  }
+})
+
 test('stream maps HTTP failures to stable retryable codes', async () => {
   const originalFetch = globalThis.fetch
   const cases = [
@@ -281,6 +399,24 @@ test('stream maps HTTP failures to stable retryable codes', async () => {
   }
 })
 
+test('stream maps context-window overflow wording to CONTEXT_WINDOW_EXCEEDED', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(
+    JSON.stringify({ error: { message: "This model's maximum context length is 6000 tokens." } }),
+    { status: 400 },
+  )
+  try {
+    const { adapter } = makeAdapter()
+    await assert.rejects(() => collect(adapter.stream({ ...MAIN_OPTIONS, sessionId: 's1' })), error => {
+      assert.ok(error instanceof AdapterError)
+      assert.equal(error.code, 'CONTEXT_WINDOW_EXCEEDED', 'the harness routes this to overflow recovery')
+      return true
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('stream surfaces transport failures as TRANSPORT', async () => {
   const originalFetch = globalThis.fetch
   globalThis.fetch = async () => {
@@ -292,6 +428,13 @@ test('stream surfaces transport failures as TRANSPORT', async () => {
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test('AdapterError carries a serializable failure snapshot for harness normalization', () => {
+  const error = new AdapterError('boom', 'RATE_LIMIT', { status: 429 })
+  assert.equal(error.code, 'RATE_LIMIT')
+  assert.deepEqual(error.failure, { message: 'boom', code: 'RATE_LIMIT', status: 429 })
+  assert.deepEqual(new AdapterError('plain', 'TRANSPORT').failure, { message: 'plain', code: 'TRANSPORT' })
 })
 
 test('resolveModel serves catalog entries and a generic fallback', async () => {

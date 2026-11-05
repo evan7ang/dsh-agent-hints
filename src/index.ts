@@ -12,24 +12,33 @@
  * - main-line requests only: auxiliary calls (purpose compaction/session-title)
  *   and requests without a session identity carry no hint;
  * - `strict_priority` is never sent by an agent (trusted-control-plane field);
- * - `prediction` is not sent: it requires an observation statistics engine
- *   (future item).
+ * - `agent_status` follows the four-value contract: `running` by default,
+ *   `pause` while a tool call is unanswered, `resume` on the first request
+ *   after a release. `finalize` never rides the header (a completed run has no
+ *   closing request) — it rides the `turn/end` status event;
+ * - `priority` is the dynamic two-level value by default (turn opening =
+ *   3/`user_waiting`, otherwise 1/`critical_path`); a static config is folded
+ *   into {1, 3}; `null` omits the field;
+ * - `cache_control` is one dynamic `ephemeral` entry with a derived TTL by
+ *   default; a static array is a verbatim override; `null` omits it;
+ * - `prediction` rides the header only when `predictionTrie`/`predictionStatic`
+ *   is configured.
  * The request body keeps the provider's original format and NEVER carries
  * hint fields.
  *
- * Serving facts (`call_index`/`epoch`/`runningSinceMs`) are derived from the
- * session's durable event log at request time — restart-safe (restored
- * sessions replay their log). `derivation.join` comes from the parent's
- * delegating tool call (`run_in_background`). The out-of-band status channel
- * (tool/running/finalize events) activates when any sink is configured
- * (`statusSink` JSONL file and/or the `statusEndpoint`/`statusAuto` HTTP
- * endpoint).
+ * Serving facts (`call_index`/`epoch`/`state`/`state_since_ms`/`turnOpening`/
+ * `intervalMs`/`afterCompaction`) are derived from the session's durable event
+ * log at request time — restart-safe (restored sessions replay their log).
+ * `derivation.join` comes from the parent's delegating tool call
+ * (`run_in_background`). The out-of-band status channel (pause/running/finalize
+ * events) activates when any sink is configured (`statusSink` JSONL file
+ * and/or the `statusEndpoint`/`statusAuto` HTTP endpoint).
  *
  * @module dsh-agent-hints
  */
 
 import type { Context, SessionLike, SessionEventLike } from '@deepseek-ai/cordis'
-import type { AgentHintPrediction, HintOptions, ServingFacts } from './hint.js'
+import type { AgentHintPrediction, AgentHintPriority, HintOptions, ServingFacts } from './hint.js'
 import { deriveServingFacts } from './hint.js'
 import { HintedDeepSeekAdapter } from './adapter.js'
 import { normalizeConfig } from './config.js'
@@ -63,11 +72,7 @@ export function apply(ctx: Context, config?: unknown): void {
     ctx.logger?.info?.(`agent-hints: no config — inheriting the DSH host endpoint (${pluginConfig.baseURL})`
       + ` and credential ref (${pluginConfig.apiKeyEnv})`)
   }
-  const hintOptions: HintOptions = {
-    agentType: pluginConfig.agentType,
-    priority: pluginConfig.priority,
-    cacheControl: pluginConfig.cacheControl,
-  }
+  const hintOptions: HintOptions = { agentType: pluginConfig.agentType }
 
   // Join tracking: the parent's delegating tool call (`run_in_background`)
   // fires on the firehose before the child's first request, so the child's
@@ -85,7 +90,28 @@ export function apply(ctx: Context, config?: unknown): void {
     if (session !== undefined) return deriveServingFacts(session)
     const next = (fallbackCounter.get(sessionId) ?? 0) + 1
     fallbackCounter.set(sessionId, next)
-    return { callIndex: next, epoch: 0 }
+    return {
+      callIndex: next,
+      epoch: 0,
+      state: 'running',
+      stateSinceMs: undefined,
+      turnOpening: next === 1,
+      intervalMs: undefined,
+      afterCompaction: false,
+    }
+  }
+
+  // Dynamic two-level priority (handoff contract): a turn-opening request is
+  // user intervention (3 / user_waiting); everything else is self-driven
+  // continuation (1 / critical_path). A static config is a folded override;
+  // `null` omits the field.
+  const priorityOf = (facts: ServingFacts): AgentHintPriority | undefined => {
+    const configured = pluginConfig.priority
+    if (configured === 'omit') return undefined
+    if (configured !== 'dynamic') return { level: configured.level, reason: configured.reason }
+    return facts.turnOpening
+      ? { level: 3, reason: 'user_waiting' }
+      : { level: 1, reason: 'critical_path' }
   }
 
   // Prediction sources: the offline trie loads once at composition (any
@@ -141,7 +167,7 @@ export function apply(ctx: Context, config?: unknown): void {
     }
     const observer = new StatusObserver(event => {
       for (const sink of sinks) sink(event)
-    }, subagentTools, pluginConfig.expectedResumeS)
+    }, subagentTools)
     ctx.on('session/event', (session: SessionLike, event: SessionEventLike) => observer.onEvent(session, event))
   }
 
@@ -160,6 +186,7 @@ export function apply(ctx: Context, config?: unknown): void {
     config: pluginConfig,
     hintOptions,
     servingFacts,
+    priorityOf,
     predictionFacts,
     derivationJoin: sessionId => delegationJoin.get(sessionId),
     sessionHeader: sessionId => ctx.get('sessions')?.get(sessionId)?.header,

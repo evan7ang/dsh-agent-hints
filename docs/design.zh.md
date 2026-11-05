@@ -103,6 +103,7 @@ hint 在 HTTP 头里、模型不可见、session log 不记录，**wire 证据�
 
 ## 6. 已知边界与后续项
 
+- **已被取代（2026-11-04）**：四值 `agent_status`、二值动态 `priority`、动态 `cache_control` 的设计见 [20261104-01](design/20261104-01-simplified-scenario-fields.md)，取代本文描述的五值状态、静态 priority 与 `pin` 默认值。
 - **协议子集**：v1 仅 chat-completions——text+tools+thinking+usage+abort；images/files 显式拒绝，messages 协议、图片表示为后续项——子集需手动跟进官方适配器演进（部署目标是自有网关，子集可控）。
 - **路由并存**：`deepseek-hint` 与官方 `deepseek-official` 并存，误切 provider 会静默失去 hint——e2e wire 断言兜底。
 - `call_index`/`epoch`/`runningSinceMs` 派生自会话日志（restore 重放），重启续接；依赖 harness 事件语义（`step/start` 前置于派发、辅助调用不进 loop step），演进需跟进。

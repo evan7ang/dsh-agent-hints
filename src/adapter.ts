@@ -24,18 +24,39 @@ import type {
   HarnessToolSchema,
   HarnessTokenUsage,
 } from '@deepseek-ai/cordis'
-import { buildAgentHint, encodeAgentHintHeader, type AgentHintPrediction, type HintOptions, type ServingFacts } from './hint.js'
+import {
+  buildAgentHint,
+  encodeAgentHintHeader,
+  type AgentHintCacheControl,
+  type AgentHintPrediction,
+  type AgentHintPriority,
+  type HintOptions,
+  type ServingFacts,
+} from './hint.js'
+import { buildCacheControl, cacheSignature, estimatePrefixTokens } from './cache.js'
 import type { PluginConfig } from './config.js'
 
 /** Stable machine-routable failure with the harness error shape (`code` distinct from `message`, `cause` preserved). */
 export class AdapterError extends Error {
   readonly code: string
   readonly status?: number
+  /**
+   * Serializable failure facts beside the live Error — the harness normalizes
+   * foreign adapter errors through an own `failure` snapshot, so without this
+   * every code would collapse to `UNKNOWN` and retry/overflow routing would
+   * never see it.
+   */
+  readonly failure: { message: string; code: string; status?: number }
   constructor(message: string, code: string, options?: { cause?: unknown; status?: number }) {
     super(message, options?.cause !== undefined ? { cause: options.cause } : undefined)
     this.name = 'LlmError'
     this.code = code
     this.status = options?.status
+    this.failure = Object.freeze({
+      message,
+      code,
+      ...options?.status === undefined ? {} : { status: options.status },
+    })
   }
 }
 
@@ -386,13 +407,23 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
  * HTTP error mapping
  * ------------------------------------------------------------------ */
 
-function httpErrorCode(status: number, providerCode: string | undefined): string {
+function httpErrorCode(status: number, providerCode: string | undefined, detail: string): string {
+  // Align with the official adapter: context-window wording routes to the
+  // harness overflow-recovery path (compaction) instead of a generic 400.
+  if ((status === 400 || status === 413) && isContextWindowExceeded(detail)) return 'CONTEXT_WINDOW_EXCEEDED'
   if (status === 401 || status === 403) return 'AUTH'
   if (status === 413) return 'INVALID_REQUEST'
   if (status === 429) return 'RATE_LIMIT'
   if (status === 400) return 'INVALID_REQUEST'
   if (status >= 500) return 'SERVER'
   return 'PROVIDER_ERROR'
+}
+
+/** Provider wording that identifies an exceeded model context window. */
+function isContextWindowExceeded(detail: string): boolean {
+  return /\b(?:maximum|max)(?:\s+(?:allowed|supported))?\s+context\s+(?:length|window)\b/i.test(detail)
+    || /\bcontext[\s_-]+(?:length|window)[\s_-]+(?:exceeded|overflow(?:ed)?)\b/i.test(detail)
+    || /\b(?:input|prompt|request)\s+(?:is\s+)?too\s+(?:long|large)\s+for\s+(?:this|the)\s+model\b/i.test(detail)
 }
 
 /* ------------------------------------------------------------------ *
@@ -409,6 +440,8 @@ export interface HintedAdapterOptions {
   config: PluginConfig
   hintOptions: HintOptions
   servingFacts: ServingFactsLookup
+  /** Per-request two-level priority resolution (dynamic or a static override); `undefined` omits the field. */
+  priorityOf: (facts: ServingFacts) => AgentHintPriority | undefined
   /** Per-request `prediction` block resolution (trie + statics); `undefined` source omits the block. */
   predictionFacts?: (sessionId: string) => AgentHintPrediction | undefined
   /** Parent's wait mode for the session's delegation, tracked from the firehose. */
@@ -423,6 +456,15 @@ export class HintedDeepSeekAdapter {
 
   providerInfo(provider: string): { id: string; name: string } {
     return { id: provider, name: 'DeepSeek (Agent Hints)' }
+  }
+
+  /**
+   * No route-owned image pricing (v1 rejects image content). The harness token
+   * meter calls this unconditionally when measuring context pressure, so a
+   * structural adapter must expose it even as a no-op.
+   */
+  imageRequestPricing(_provider: string, _model: string): undefined {
+    return undefined
   }
 
   /** No override → the harness layer applies its normal default retry policy. */
@@ -461,36 +503,78 @@ export class HintedDeepSeekAdapter {
     }
   }
 
+  /** Process-local per-session prefix signature (model + tool set) for cache suppression. */
+  private readonly signatures = new Map<string, string>()
+
+  /**
+   * Dynamic `cache_control` for one main-line request. The declaration covers
+   * the current prefix, so it is suppressed when the prefix just changed
+   * (compaction rewrite, model/tool-set change) or is shorter than one engine
+   * block. The signature is process-local: after a restart the previous one is
+   * unknown, so requests with `call_index > 1` conservatively skip one round.
+   */
+  private resolveCacheControl(
+    sessionId: string,
+    options: HarnessGenerateOptions,
+    body: WireRequest,
+    facts: ServingFacts,
+  ): AgentHintCacheControl[] | undefined {
+    const mode = this.options.config.cacheControl
+    if (mode === 'omit') return undefined
+    const signature = cacheSignature(options.model, options.tools?.map(tool => tool.name))
+    const previous = this.signatures.get(sessionId)
+    const stable = previous !== undefined ? previous === signature : facts.callIndex === 1
+    this.signatures.set(sessionId, signature)
+    if (!stable || facts.afterCompaction) return undefined
+    if (mode !== 'dynamic') {
+      return mode.map(entry => ({
+        ...entry,
+        ...entry.range !== undefined ? { range: { ...entry.range } } : {},
+      }))
+    }
+    return buildCacheControl(body.messages.length, estimatePrefixTokens(body.messages), facts.intervalMs)
+  }
+
   async *stream(options: HarnessGenerateOptions): AsyncGenerator<HarnessStreamChunk> {
     const { config } = this.options
     // Emission rules: main-line requests only — auxiliary calls
     // (compaction/session-title) and requests without a session identity
-    // carry no hint. The body keeps the provider's original format.
+    // carry no hint. The body keeps the provider's original format, and the
+    // cache declaration needs the wire shape, so serialization comes first.
+    const facts = options.sessionId !== undefined && options.purpose === undefined
+      ? this.options.servingFacts(options.sessionId)
+      : undefined
+    const body = serializeRequest(options, config)
     let hint: ReturnType<typeof buildAgentHint> | undefined
-    if (options.sessionId !== undefined && options.purpose === undefined) {
-      const header = this.options.sessionHeader(options.sessionId)
+    if (facts !== undefined && options.sessionId !== undefined) {
+      const sessionId = options.sessionId
+      const header = this.options.sessionHeader(sessionId)
       hint = buildAgentHint(
         {
-          sessionId: options.sessionId,
-          ...this.options.servingFacts(options.sessionId),
-          prediction: this.options.predictionFacts?.(options.sessionId),
+          sessionId,
+          callIndex: facts.callIndex,
+          epoch: facts.epoch,
+          state: facts.state,
+          stateSinceMs: facts.stateSinceMs,
           parentSession: header?.parentSession,
           parentOrigin: header?.origin,
           derivationJoin: header?.parentSession !== undefined
             ? this.options.derivationJoin(header.parentSession)
             : undefined,
+          priority: this.options.priorityOf(facts),
+          cacheControl: this.resolveCacheControl(sessionId, options, body, facts),
+          prediction: this.options.predictionFacts?.(sessionId),
         },
         this.options.hintOptions,
         Date.now(),
       )
     }
 
-    const body = serializeRequest(options, config)
     const headers: Record<string, string> = {
       'authorization': `Bearer ${await this.options.resolveApiKey()}`,
       'content-type': 'application/json',
       'accept': 'text/event-stream',
-      'user-agent': 'dsh-agent-hints/0.2.2 (+https://github.com/evan7ang/dsh-agent-hints)',
+      'user-agent': 'dsh-agent-hints/0.3.0 (+https://github.com/evan7ang/dsh-agent-hints)',
       // Identity/intent signals mirror the official adapter's conventions so
       // gateway consumers see the same transport metadata on this route.
       ...options.sessionId !== undefined
@@ -528,7 +612,8 @@ export class HintedDeepSeekAdapter {
       } catch {
         // The HTTP status remains authoritative when a gateway returns malformed JSON.
       }
-      throw new AdapterError(message, httpErrorCode(response.status, providerCode), {
+      const detail = `${providerCode ?? ''} ${message}`
+      throw new AdapterError(message, httpErrorCode(response.status, providerCode, detail), {
         status: response.status,
         cause: new Error(raw.length > 0 ? raw : `DeepSeek HTTP ${response.status}`),
       })

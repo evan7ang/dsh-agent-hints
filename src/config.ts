@@ -21,6 +21,12 @@ export interface ModelCatalogEntry {
   maxTokens: number
 }
 
+/** Priority emission mode: dynamic two-level (default), a static override, or omitted entirely. */
+export type PriorityConfig = 'dynamic' | 'omit' | AgentHintPriority
+
+/** Cache-control emission mode: dynamic single ephemeral entry (default), a static override, or omitted entirely. */
+export type CacheControlConfig = 'dynamic' | 'omit' | AgentHintCacheControl[]
+
 /** Validated plugin configuration. Every field carries an inherited default; the patch-row config only overrides. */
 export interface PluginConfig {
   /** Upstream endpoint base; every chat request posts to `${baseURL}/chat/completions`. Inherits `$DEEPSEEK_BASE_URL` → the public API default. */
@@ -29,10 +35,20 @@ export interface PluginConfig {
   apiKeyEnv: string
   /** Agent type reported as `session.agent_type`. */
   agentType: string
-  /** Soft priority; `undefined` omits the field. */
-  priority?: AgentHintPriority
-  /** Cache control entries; `undefined` omits the field. */
-  cacheControl?: AgentHintCacheControl[]
+  /**
+   * Soft priority. `dynamic` (default): level 3 + `user_waiting` on turn-opening
+   * requests, level 1 + `critical_path` everywhere else. A static object is a
+   * constant override folded into the two-level domain {1, 3}. `omit` never
+   * sends the field.
+   */
+  priority: PriorityConfig
+  /**
+   * Cache control. `dynamic` (default): one `ephemeral` entry whose TTL is
+   * derived from the last request interval. A static array is a verbatim
+   * override (ephemeral only, explicit `ttl_s`, at most one entry). `omit`
+   * never sends the field.
+   */
+  cacheControl: CacheControlConfig
   /** Deployment thinking policy; `disabled` limits every conversation request to `off`. */
   thinking?: 'enabled' | 'disabled'
   /** Default reasoning effort when a request carries none. */
@@ -55,19 +71,11 @@ export interface PluginConfig {
   predictionStatic?: PredictionStatic
   /** Minimum node sample count for a trie distribution to be trusted over the static value. */
   predictionMinSamples: number
-  /** Expected seconds until resume, carried on `pause`/`suspend` status events (business callbacks provide the trigger). */
-  expectedResumeS?: number
   /** Tool names treated as subagent delegation for `derivation.join` and `agent:<name>` status naming. */
   subagentToolNames: string[]
 }
 
 export const DEFAULT_AGENT_TYPE = 'agent'
-
-/** Interactive work waiting on the user. */
-export const DEFAULT_PRIORITY: AgentHintPriority = { level: 3, reason: 'user_waiting' }
-
-/** Pin the system prompt (message range [0, 1)): the byte-stable prefix is already guaranteed by the loop; this declares the intent explicitly. */
-export const DEFAULT_CACHE_CONTROL: AgentHintCacheControl[] = [{ type: 'pin', range: { end: 1 } }]
 
 /** Built-in advisory catalog, aligned with the official adapter's deepseek-flash family metadata. */
 export const DEFAULT_MODELS: ModelCatalogEntry[] = [
@@ -103,26 +111,42 @@ function fail(field: string, expectation: string): never {
   throw new Error(`agent-hints: config${field} ${expectation}`)
 }
 
+/**
+ * Fold one soft-priority level onto the two-level contract domain {1, 3}
+ * (admission anchor: 3 = user-intervened, 1 = everything else). Legacy {2, 4}
+ * fold to their nearest value and out-of-range values collapse onto the
+ * admission line, so the admission verdict never changes.
+ */
+export function foldPriorityLevel(level: number): 1 | 3 {
+  return level >= 3 ? 3 : 1
+}
+
 function normalizePriority(raw: unknown, field: string): AgentHintPriority {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) fail(field, 'must be an object')
   const { level, reason } = raw as Record<string, unknown>
   if (typeof level !== 'number' || !Number.isFinite(level)) fail(`${field}.level`, 'must be a finite number')
   if (typeof reason !== 'string') fail(`${field}.reason`, 'must be a string')
-  return { level, reason }
+  return { level: foldPriorityLevel(level), reason }
 }
 
-function normalizeCacheControl(raw: unknown, field: string): AgentHintCacheControl[] {
+/**
+ * Validate one static cache-control override under the retired-`pin` rules:
+ * ephemeral only, explicit positive `ttl_s`, at most one entry (single
+ * breakpoint), and `message` as the only supported range unit.
+ */
+function normalizeCacheEntries(raw: unknown, field: string): 'omit' | AgentHintCacheControl[] {
   if (!Array.isArray(raw)) fail(field, 'must be an array')
+  if (raw.length === 0) return 'omit'
+  if (raw.length > 1) fail(field, 'must contain at most one entry (a single breakpoint)')
   return raw.map((entry, index) => {
     const path = `${field}[${index}]`
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) fail(path, 'must be an object')
     const { type, ttl_s: ttlS, range } = entry as Record<string, unknown>
-    if (type !== 'pin' && type !== 'ephemeral') fail(`${path}.type`, 'must be "pin" or "ephemeral"')
-    const normalized: AgentHintCacheControl = { type }
-    if (ttlS !== undefined) {
-      if (typeof ttlS !== 'number' || !Number.isFinite(ttlS) || ttlS <= 0) fail(`${path}.ttl_s`, 'must be a positive number')
-      normalized.ttl_s = ttlS
+    if (type !== 'ephemeral') fail(`${path}.type`, 'must be "ephemeral" ("pin" is retired)')
+    if (typeof ttlS !== 'number' || !Number.isFinite(ttlS) || ttlS <= 0) {
+      fail(`${path}.ttl_s`, 'must be a positive number (a declaration needs an explicit TTL)')
     }
+    const normalized: AgentHintCacheControl = { type, ttl_s: ttlS }
     if (range !== undefined) {
       if (typeof range !== 'object' || range === null || Array.isArray(range)) fail(`${path}.range`, 'must be an object')
       const { start, end, unit } = range as Record<string, unknown>
@@ -137,7 +161,7 @@ function normalizeCacheControl(raw: unknown, field: string): AgentHintCacheContr
         normalizedRange.end = end
       }
       if (unit !== undefined) {
-        if (unit !== 'message' && unit !== 'token') fail(`${path}.range.unit`, 'must be "message" or "token"')
+        if (unit !== 'message') fail(`${path}.range.unit`, 'must be "message"')
         normalizedRange.unit = unit
       }
       normalized.range = normalizedRange
@@ -201,16 +225,18 @@ export function normalizeConfig(raw: unknown): PluginConfig {
   if (typeof defaultMaxTokens !== 'number' || !Number.isInteger(defaultMaxTokens) || defaultMaxTokens <= 0) {
     fail('.defaultMaxTokens', 'must be a positive integer')
   }
+  const priority: PriorityConfig = record.priority === undefined
+    ? 'dynamic'
+    : record.priority === null ? 'omit' : normalizePriority(record.priority, '.priority')
+  const cacheControl: CacheControlConfig = record.cacheControl === undefined
+    ? 'dynamic'
+    : record.cacheControl === null ? 'omit' : normalizeCacheEntries(record.cacheControl, '.cacheControl')
   return {
     baseURL: baseURL.replace(/\/+$/, ''),
     apiKeyEnv,
     agentType,
-    priority: record.priority === undefined
-      ? { ...DEFAULT_PRIORITY }
-      : record.priority === null ? undefined : normalizePriority(record.priority, '.priority'),
-    cacheControl: record.cacheControl === undefined
-      ? DEFAULT_CACHE_CONTROL
-      : record.cacheControl === null ? undefined : normalizeCacheControl(record.cacheControl, '.cacheControl'),
+    priority,
+    cacheControl,
     thinking: record.thinking as PluginConfig['thinking'],
     reasoningEffort,
     models,
@@ -222,7 +248,6 @@ export function normalizeConfig(raw: unknown): PluginConfig {
     predictionTrie: record.predictionTrie === undefined ? undefined : normalizePath(record.predictionTrie, '.predictionTrie'),
     predictionStatic: record.predictionStatic === undefined ? undefined : normalizePredictionStatic(record.predictionStatic),
     predictionMinSamples: record.predictionMinSamples === undefined ? DEFAULT_PREDICTION_MIN_SAMPLES : normalizePositiveInteger(record.predictionMinSamples, '.predictionMinSamples'),
-    expectedResumeS: record.expectedResumeS === undefined ? undefined : normalizePositiveNumber(record.expectedResumeS, '.expectedResumeS'),
     subagentToolNames: record.subagentToolNames === undefined
       ? ['subagent']
       : normalizeStringList(record.subagentToolNames, '.subagentToolNames'),
@@ -256,11 +281,6 @@ function normalizePredictionStatic(raw: unknown): PredictionStatic {
 
 function normalizePositiveInteger(raw: unknown, field: string): number {
   if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) fail(field, 'must be a positive integer')
-  return raw
-}
-
-function normalizePositiveNumber(raw: unknown, field: string): number {
-  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) fail(field, 'must be a positive number')
   return raw
 }
 

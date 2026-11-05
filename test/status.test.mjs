@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MulanPSL-2.0
-// Unit tests for the out-of-band status channel: the pending-call state
-// machine (tool → running on the last parallel result), subagent naming and
-// child binding, finalize on session disposal, and the JSONL sink — running
-// against the committed built JS (lib/).
+// Unit tests for the out-of-band status channel: the folded four-value
+// lifecycle (pause on tool calls, running on the last parallel result),
+// subagent naming and child binding, finalize on turn completion, and the
+// sinks — running against the committed built JS (lib/).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -21,16 +21,17 @@ function harness(subagentToolNames = ['subagent']) {
   return { observer, events }
 }
 
-test('tool/call reports tool state; running only after the LAST parallel result', () => {
+test('tool/call reports pause pinned to the episode start; running only after the LAST parallel result', () => {
   const { observer, events } = harness()
   const s = session('s1')
 
   observer.onEvent(s, { type: 'tool/call', time: 10, data: { name: 'probe_tool', callId: 'c1' } })
   observer.onEvent(s, { type: 'tool/call', time: 11, data: { name: 'inspect_files', callId: 'c2' } })
   assert.deepEqual(events[0].agent_status, {
-    state: 'tool', state_since_ms: 10, reason: 'await_tool',
+    state: 'pause', state_since_ms: 10, reason: 'await_tool',
     tools: [{ name: 'probe_tool', call_id: 'c1' }],
   })
+  assert.equal(events.at(-1).agent_status.state_since_ms, 10, 'the second call keeps the episode start')
   assert.equal(events.at(-1).agent_status.tools.length, 2)
 
   observer.onEvent(s, { type: 'tool/result', time: 12, data: { message: { content: [{ type: 'tool-result', toolCallId: 'c1' }] } } })
@@ -43,6 +44,7 @@ test('delegation calls are named agent:<tool> and bind child_session_id on first
   const { observer, events } = harness()
   const parent = session('parent')
   observer.onEvent(parent, { type: 'tool/call', time: 10, data: { name: 'subagent', callId: 'd1' } })
+  assert.equal(events.at(-1).agent_status.state, 'pause')
   assert.equal(events.at(-1).agent_status.tools[0].name, 'agent:subagent')
 
   observer.onEvent(session('child', { parentSession: 'parent', origin: 'subagent' }), { type: 'request/header', time: 11 })
@@ -60,50 +62,37 @@ test('turn completion reports finalize and clears pending state', () => {
   const s = session('s1')
   observer.onEvent(s, { type: 'tool/call', time: 10, data: { name: 't', callId: 'c1' } })
   observer.onEvent(s, { type: 'turn/end', time: 11, data: { reason: { kind: 'completed' } } })
-  assert.equal(events.at(-1).agent_status.state, 'finalize')
+  assert.deepEqual(events.map(event => event.agent_status.state), ['pause', 'finalize'])
   // Completed sessions must not leak later reports.
   observer.onEvent(s, { type: 'tool/result', time: 12, data: { message: { content: [{ type: 'tool-result', toolCallId: 'c1' }] } } })
   assert.equal(events.length, 2)
 })
 
-test('non-completed turn ends do not report finalize', () => {
+test('non-completed turn ends report no finalize but still clear pending state', () => {
   const { observer, events } = harness()
   const s = session('s1')
+  observer.onEvent(s, { type: 'tool/call', time: 9, data: { name: 't', callId: 'c1' } })
   observer.onEvent(s, { type: 'turn/end', time: 10, data: { reason: { kind: 'aborted', reason: 'user' } } })
-  observer.onEvent(s, { type: 'turn/end', time: 11, data: { reason: { kind: 'blocked' } } })
-  assert.equal(events.length, 0)
+  assert.equal(events.length, 1, 'no finalize for an aborted turn')
+  observer.onEvent(s, { type: 'tool/result', time: 12, data: { message: { content: [{ type: 'tool-result', toolCallId: 'c1' }] } } })
+  assert.equal(events.length, 1, 'the pending set was cleared at the turn boundary')
 })
 
 test('appendStatusEvent writes protocol-shaped JSONL lines in order', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-hints-status-'))
   const sink = join(dir, 'status.jsonl')
   const warns = []
-  appendStatusEvent(sink, { session: { session_id: 's1' }, agent_status: { state: 'tool', state_since_ms: 1, reason: 'await_tool', tools: [{ name: 't', call_id: 'c1' }] } }, w => warns.push(w))
+  appendStatusEvent(sink, { session: { session_id: 's1' }, agent_status: { state: 'pause', state_since_ms: 1, reason: 'await_tool', tools: [{ name: 't', call_id: 'c1' }] } }, w => warns.push(w))
   appendStatusEvent(sink, { session: { session_id: 's1' }, agent_status: { state: 'finalize', state_since_ms: 2 } }, w => warns.push(w))
   const lines = readFileSync(sink, 'utf8').trim().split('\n').map(JSON.parse)
   assert.equal(lines.length, 2)
-  assert.equal(lines[0].agent_status.state, 'tool')
+  assert.equal(lines[0].agent_status.state, 'pause')
   assert.equal(lines[1].agent_status.state, 'finalize')
   assert.equal('agent_hints' in lines[0], false)
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('emitPause carries the configured expected_resume_s; the field is absent without one', () => {
-  const events = []
-  const observer = new StatusObserver(event => events.push(event), new Set(), 600)
-  observer.emitPause('s1', 'pause', 1000, 'human_approval')
-  assert.deepEqual(events, [{
-    session: { session_id: 's1' },
-    agent_status: { state: 'pause', state_since_ms: 1000, reason: 'human_approval' },
-    prediction: { expected_resume_s: 600 },
-  }])
-  const plain = []
-  const observer2 = new StatusObserver(event => plain.push(event), new Set())
-  observer2.emitPause('s1', 'suspend', 2000)
-  assert.deepEqual(plain, [{ session: { session_id: 's1' }, agent_status: { state: 'suspend', state_since_ms: 2000 } }])
-})
-
-const EVENT_A = { session: { session_id: 's1' }, agent_status: { state: 'tool', state_since_ms: 1 } }
+const EVENT_A = { session: { session_id: 's1' }, agent_status: { state: 'pause', state_since_ms: 1, reason: 'await_tool' } }
 const EVENT_B = { session: { session_id: 's1' }, agent_status: { state: 'running', state_since_ms: 2 } }
 const EVENT_C = { session: { session_id: 's1' }, agent_status: { state: 'finalize', state_since_ms: 3 } }
 

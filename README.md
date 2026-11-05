@@ -26,6 +26,9 @@ This differs from static header-injection approaches (e.g. wrapping `fetch` to s
 
 - **Main-line requests only**: auxiliary calls (`compaction`, `session-title` purposes) and requests without a session identity carry no hint.
 - `strict_priority` is **never sent** by an agent (trusted-control-plane field).
+- `agent_status` follows the four-value contract. `running` by default; `pause` while a tool call is unanswered (every tool call counts as waiting on something external, per this deployment's adjudication); `resume` on the first request after the release, one-shot. `finalize` never rides the header — a completed run has no closing request — it rides the `turn/end(completed)` status event.
+- `priority` is the dynamic two-level value by default: turn-opening requests are user intervention (`3` / `user_waiting`), everything else is self-driven continuation (`1` / `critical_path`). A static `{level, reason}` is a constant override folded into `{1, 3}`; `null` omits the field.
+- `cache_control` is one dynamic `ephemeral` entry by default: `range.end` is the wire message count and `ttl_s = clamp(last interval × 2, 60, 3600)`. Declarations are suppressed for a compaction round, a model/tool-set change, or a prefix below 128 estimated tokens. A static array is a verbatim override (ephemeral only, explicit `ttl_s`); `null` omits it.
 - `prediction` rides the same header when a source is configured (`predictionTrie` and/or `predictionStatic`); with no source configured the block is omitted and the wire shape is unchanged. Values come from an offline trie (longest tool-sequence-prefix match) with per-field static fallback.
 - Session identity mirrors the official adapter: `x-deepseek-harness-session-id` (when a session id exists) and `x-deepseek-harness-compact: 1` (on compaction) are sent as-is.
 
@@ -40,9 +43,9 @@ This differs from static header-injection approaches (e.g. wrapping `fetch` to s
     "epoch": 0                // derived from compaction/end count; restart-safe
     // "parent_session_id" / "derivation": {"relation": "spawn"|"fork", "join": "sync"|"async"} — lineage sessions only
   },
-  "agent_status": { "state": "running", "state_since_ms": 1760000000000 },
-  "priority": { "level": 3, "reason": "user_waiting" },          // configured; null omits
-  "cache_control": [{ "type": "pin", "range": { "end": 1 } }],   // configured; null omits
+  "agent_status": { "state": "running", "state_since_ms": 1760000000000 },  // running | pause | resume
+  "priority": { "level": 3, "reason": "user_waiting" },           // dynamic two-level; static override; null omits
+  "cache_control": [{ "type": "ephemeral", "ttl_s": 600, "range": { "end": 3, "unit": "message" } }],  // dynamic; null omits
   // "prediction": { "latency_ms": 8251, "remaining_calls": 2, "output_tokens": 640,
   //   "interval_ms": 251, "remaining_time_ms": 42000,
   //   "next_action": { "state": "tool", "tools": [{"name": "web_search", "expected_duration_s": 9}], "prob": 0.8 } }
@@ -50,7 +53,7 @@ This differs from static header-injection approaches (e.g. wrapping `fetch` to s
 }
 ```
 
-Out-of-band status events (`tool` → `running` → `finalize` per working session, incl. awaited tool names and call ids) are reported to the optional `statusSink` (local JSONL file); the `emit()` seam is where a gateway client takes over.
+Out-of-band status events (`pause` → `running` → `finalize` per working session, incl. awaited tool names and call ids) are reported to the optional `statusSink` (local JSONL file); the `emit()` seam is where a gateway client takes over.
 
 ## Install
 
@@ -91,8 +94,8 @@ The API key resolves per request: credentials service first (`$DSH_HOME/.credent
 | `baseURL` | string | inherits `$DEEPSEEK_BASE_URL` → `https://api.deepseek.com` | Upstream base; every chat request posts to `${baseURL}/chat/completions` |
 | `apiKeyEnv` | string | inherits `$DEEPSEEK_API_KEY_ENV` → `DEEPSEEK_API_KEY` | Environment-variable name resolved per request (credentials service first) |
 | `agentType` | string | `agent` | Reported as `session.agent_type` |
-| `priority` | `{level, reason}` or `null` | `{level: 3, reason: "user_waiting"}` | Soft priority; `null` omits the field |
-| `cacheControl` | array or `null` | `[{type: "pin", range: {end: 1}}]` | Cache control entries; `null` omits |
+| `priority` | `"dynamic"`, `{level, reason}`, or `null` | `"dynamic"` | Two-level soft priority. Dynamic: `3`/`user_waiting` on turn-opening requests, `1`/`critical_path` otherwise. A static object is folded into `{1, 3}`; `null` omits the field |
+| `cacheControl` | `"dynamic"`, array, or `null` | `"dynamic"` | Dynamic: one `ephemeral` entry with a derived TTL. A static array is a verbatim override (`ephemeral` only, explicit `ttl_s`, at most one entry); `null` omits the field |
 | `thinking` | `"enabled"` / `"disabled"` | enabled | `disabled` limits every conversation request to `off` |
 | `reasoningEffort` | `"off"/"low"/"high"/"max"` | `high` | Default reasoning effort when a request carries none |
 | `models` | `{id, name, contextWindow, maxTokens}[]` | DeepSeek-V4 family catalog | Advisory model catalog for `resolveModel`; **provide real limits when pointing at your own gateway** (they feed compaction decisions) |
@@ -104,7 +107,6 @@ The API key resolves per request: credentials service first (`$DSH_HOME/.credent
 | `predictionTrie` | string | unset (block off) | Offline prediction trie (built by `scripts/build-prediction-trie.mjs`); enables trie-sourced `prediction` values |
 | `predictionStatic` | object | unset | Static per-field fallbacks (`latency_ms`/`remaining_calls`/`output_tokens`/`interval_ms`/`remaining_time_ms`); configuring this or `predictionTrie` turns the `prediction` block on |
 | `predictionMinSamples` | positive integer | `5` | Minimum node sample count for a trie distribution to be trusted over the static value |
-| `expectedResumeS` | positive number | unset | Expected seconds until resume, carried on `pause`/`suspend` status events (business callbacks provide the trigger) |
 | `subagentToolNames` | string[] | `["subagent"]` | Tool names treated as subagent delegation for `derivation.join` and status naming |
 
 Invalid config aborts composition at load time with a field path — request-time hint construction has no failure path.
@@ -114,6 +116,10 @@ Invalid config aborts composition at load time with a field path — request-tim
 - Chat-completions wire only; subset: text + tools + thinking + usage + abort. Image/file content is rejected explicitly (`UNSUPPORTED_CONTENT`), never silently degraded.
 - The protocol subset must be kept in sync with the official adapter manually (the deployment target is your own gateway, so the subset is under control).
 - `call_index`/`epoch`/`state_since_ms` are derived from the session's event log and depend on harness event semantics (`step/start` precedes dispatch; auxiliary calls do not count as loop steps).
+- Tool waits are reported as `pause` (this deployment's adjudication): the four-value contract's literal "tool execution counts as running" is folded at the sender, so consumers see `pause` for every awaited tool call.
+- The one-shot `resume` is re-sent when the harness retries a request — the sender cannot know whether a header was delivered.
+- Human-approval priority boosts are not implemented: a tool gate cannot be distinguished from a human gate, so only turn-opening requests carry `level: 3`.
+- `cache_control` TTL uses the last request interval only; the next-tool-duration signal would need `prediction.next_action`, which this deployment does not configure.
 - `derivation.join` reads the parent's most recent delegating tool call — parallel delegations share the latest value (accepted approximation).
 - Switching providers back to `deepseek-official` silently drops hints; the e2e wire assertions below are the safety net.
 - **Always-thinking models**: the session-title auxiliary call forces `thinking: {type: "disabled"}` (official convention). Gateways backed by always-thinking models (e.g. `glm-5.3-flash` on Volcengine) reject it with an error; the harness tolerates the failure — the task itself is unaffected — but such sessions get no generated title. Prefer a model that supports thinking-off for auxiliary calls, or accept untitled sessions (verified on a real gateway: main-line requests with `thinking: enabled` + `reasoning_effort` are accepted, the task completes exit 0, and the hint header reaches the gateway).
@@ -124,7 +130,9 @@ Invalid config aborts composition at load time with a field path — request-tim
 npm install
 npm run build        # src/ → lib/ (built JS is committed)
 npm test             # node --test against the built JS
-e2e/run.sh           # keyless wire e2e: local SSE capture stub + hinted route + report assertions
+e2e/run.sh           # keyless wire e2e through a real harness: probe round trip,
+                     # foreground subagent delegation, session adoption, and an
+                     # overflow-compaction round — asserts every hint field
 ```
 
 The e2e resolves the `dsh` runtime from `DSH_BIN`, `PATH`, or a deepseek-harness checkout (`DSH_CHECKOUT` or the sibling directory).

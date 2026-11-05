@@ -83,7 +83,10 @@ test('apply derives serving facts from the session log and join from the delegat
   const main = await collect(adapters[0].stream({ provider: 'deepseek-hint', model: 'm', messages: [], sessionId: 's1' }))
   const hint = JSON.parse(Buffer.from(main.headerCapture, 'base64url').toString('utf8'))
   assert.equal(hint.session.call_index, 2, 'derived from two step/start events')
-  assert.equal(hint.agent_status.state_since_ms, 3, 'latest tool/result time from the log')
+  assert.equal(hint.agent_status.state, 'resume', 'the first request after the tool release')
+  assert.equal(hint.agent_status.state_since_ms, 3, 'pinned to the release (tool/result) time')
+  assert.deepEqual(hint.priority, { level: 1, reason: 'critical_path' }, 'mid-run continuation is not user intervention')
+  assert.equal('cache_control' in hint, false, 'no logical input to declare')
 
   // A child of the delegating parent carries derivation.join.
   sessions.get = id => id === 'child'
@@ -122,6 +125,8 @@ test('apply without a session store falls back to a per-process ordinal', async 
   const second = JSON.parse(Buffer.from((await collect(adapters[0].stream(options))).headerCapture, 'base64url').toString('utf8'))
   assert.equal(first.session.call_index, 1)
   assert.equal(second.session.call_index, 2)
+  assert.deepEqual(first.priority, { level: 3, reason: 'user_waiting' }, 'the first fallback call is a turn opening')
+  assert.deepEqual(second.priority, { level: 1, reason: 'critical_path' }, 'later fallback calls are continuation')
 })
 
 test('unconfigured apply inherits the host endpoint and activates', async () => {
@@ -149,8 +154,27 @@ test('config normalization: absent fields inherit the host chain, provided-inval
     const inherited = normalizeConfig(undefined)
     assert.equal(inherited.baseURL, 'http://motor.local:18201/v1', 'inherits $DEEPSEEK_BASE_URL')
     assert.equal(inherited.apiKeyEnv, 'DEEPSEEK_API_KEY', 'credential ref inherits the official default')
+    assert.equal(inherited.priority, 'dynamic', 'priority defaults to the dynamic two-level mode')
+    assert.equal(inherited.cacheControl, 'dynamic', 'cache control defaults to the dynamic mode')
     assert.throws(() => normalizeConfig({ baseURL: 'not-a-url' }), /baseURL/)
     assert.throws(() => normalizeConfig({ baseURL: 'http://gw.local/v1', apiKeyEnv: '' }), /apiKeyEnv/)
+    // Two-level priority: null omits, static overrides fold into {1, 3}.
+    assert.equal(normalizeConfig({ priority: null }).priority, 'omit')
+    assert.deepEqual(normalizeConfig({ priority: { level: 7, reason: 'x' } }).priority, { level: 3, reason: 'x' })
+    assert.deepEqual(normalizeConfig({ priority: { level: 2, reason: 'x' } }).priority, { level: 1, reason: 'x' })
+    // Cache control: pin retired, ttl mandatory, single breakpoint, message unit.
+    assert.equal(normalizeConfig({ cacheControl: null }).cacheControl, 'omit')
+    assert.equal(normalizeConfig({ cacheControl: [] }).cacheControl, 'omit')
+    assert.deepEqual(
+      normalizeConfig({ cacheControl: [{ type: 'ephemeral', ttl_s: 120, range: { end: 3, unit: 'message' } }] }).cacheControl,
+      [{ type: 'ephemeral', ttl_s: 120, range: { end: 3, unit: 'message' } }],
+    )
+    assert.throws(() => normalizeConfig({ cacheControl: [{ type: 'pin' }] }), /ephemeral/)
+    assert.throws(() => normalizeConfig({ cacheControl: [{ type: 'ephemeral' }] }), /ttl_s/)
+    assert.throws(() => normalizeConfig({
+      cacheControl: [{ type: 'ephemeral', ttl_s: 60 }, { type: 'ephemeral', ttl_s: 60 }],
+    }), /at most one/)
+    assert.throws(() => normalizeConfig({ cacheControl: [{ type: 'ephemeral', ttl_s: 60, range: { unit: 'token' } }] }), /message/)
   } finally {
     if (originalBaseURL === undefined) delete process.env.DEEPSEEK_BASE_URL
     else process.env.DEEPSEEK_BASE_URL = originalBaseURL
@@ -174,7 +198,7 @@ test('status sink activates only when configured and records the session lifecyc
     observer(s, { type: 'tool/call', time: 1, data: { name: 't', callId: 'c1' } })
     observer(s, { type: 'turn/end', time: 2, data: { reason: { kind: 'completed' } } })
     const lines = readFileSync(sink, 'utf8').trim().split('\n').map(JSON.parse)
-    assert.deepEqual(lines.map(line => line.agent_status.state), ['tool', 'finalize'])
+    assert.deepEqual(lines.map(line => line.agent_status.state), ['pause', 'finalize'])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
