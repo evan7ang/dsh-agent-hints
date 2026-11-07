@@ -123,9 +123,11 @@ function serializeAssistant(message: HarnessMessage): WireMessage {
 }
 
 /**
- * Serialize the conversation. `tool-result` blocks ride user-role messages in
- * the harness vocabulary but the wire wants standalone `{role: 'tool'}` entries;
- * a mixed user message contributes its text first and its tool results after.
+ * Serialize the conversation. The wire wants standalone `{role: 'tool'}`
+ * entries for results; they arrive either as first-class tool-role messages
+ * (harness ≥ 0.2.2 vocabulary) or as `tool-result` blocks riding user-role
+ * messages (legacy vocabulary). A mixed user message contributes its text
+ * first and its tool results after.
  */
 export function serializeMessages(messages: readonly HarnessMessage[]): WireMessage[] {
   const wire: WireMessage[] = []
@@ -137,6 +139,15 @@ export function serializeMessages(messages: readonly HarnessMessage[]): WireMess
     }
     if (message.role === 'assistant') {
       wire.push(serializeAssistant(message))
+      continue
+    }
+    if (message.role === 'tool') {
+      wire.push({
+        role: 'tool',
+        ...message.toolCallId !== undefined ? { tool_call_id: message.toolCallId } : {},
+        // Empty tool output still needs SOME content on the wire.
+        content: flattenText(message.content) || '(no output)',
+      })
       continue
     }
     const toolResults = message.content.filter(
@@ -527,9 +538,15 @@ export class HintedDeepSeekAdapter {
     this.signatures.set(sessionId, signature)
     if (!stable || facts.afterCompaction) return undefined
     if (mode !== 'dynamic') {
+      // Static override: the config owns the POLICY (type/ttl); an absent
+      // `range` follows this request's wire message count (a declaration
+      // without a range pins nothing the consumer can locate). An explicitly
+      // configured range is respected verbatim.
       return mode.map(entry => ({
         ...entry,
-        ...entry.range !== undefined ? { range: { ...entry.range } } : {},
+        range: entry.range !== undefined
+          ? { ...entry.range }
+          : { end: body.messages.length, unit: 'message' },
       }))
     }
     return buildCacheControl(body.messages.length, estimatePrefixTokens(body.messages), facts.intervalMs)
@@ -574,7 +591,7 @@ export class HintedDeepSeekAdapter {
       'authorization': `Bearer ${await this.options.resolveApiKey()}`,
       'content-type': 'application/json',
       'accept': 'text/event-stream',
-      'user-agent': 'dsh-agent-hints/0.3.0 (+https://github.com/evan7ang/dsh-agent-hints)',
+      'user-agent': 'dsh-agent-hints/0.3.1 (+https://github.com/evan7ang/dsh-agent-hints)',
       // Identity/intent signals mirror the official adapter's conventions so
       // gateway consumers see the same transport metadata on this route.
       ...options.sessionId !== undefined

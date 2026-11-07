@@ -34,7 +34,7 @@ export interface AgentHintSession {
  * lifecycle contract, and ONLY `state` + `state_since_ms` (diagnostic fields
  * stay on the out-of-band event channel). DSH never sends `finalize` on the
  * header — a completed run has no closing request — so it rides the
- * `turn/end(completed)` status event instead.
+ * session-scoped `session/disposed` status event instead.
  */
 export interface AgentHintAgentStatus {
   state: 'running' | 'pause' | 'resume' | 'finalize'
@@ -184,9 +184,29 @@ export interface DerivationEvent {
   data?: {
     /** `tool/call`: provider-issued call id pairing call with result. */
     callId?: unknown
-    /** `tool/result`: the result message whose content blocks carry the settled `toolCallId`. */
-    message?: { content?: Array<{ type?: unknown; toolCallId?: unknown }> }
+    /**
+     * `tool/result`: the settled result message. Current vocabulary:
+     * first-class tool-role message with a top-level `toolCallId`; legacy
+     * vocabulary: user message carrying a `tool-result` content block.
+     */
+    message?: {
+      toolCallId?: unknown
+      content?: Array<{ type?: unknown; toolCallId?: unknown }>
+    }
   }
+}
+
+/**
+ * Pair one `tool/result` event with its call. Two payload vocabularies exist
+ * in the wild: harness ≥ 0.2.2 appends a first-class tool-role message whose
+ * top-level `toolCallId` settles the call; earlier versions wrapped the
+ * result in a `tool-result` content block on a user message.
+ */
+export function toolResultCallId(event: DerivationEvent): string | undefined {
+  const message = event.data?.message
+  if (typeof message?.toolCallId === 'string') return message.toolCallId
+  const block = message?.content?.find(candidate => candidate?.type === 'tool-result')
+  return typeof block?.toolCallId === 'string' ? block.toolCallId : undefined
 }
 
 /** The minimal session-log view the derivation reads. */
@@ -210,12 +230,6 @@ export interface ServingFacts {
   intervalMs?: number
   /** A compaction rewrite completed between the previous and the current main-line call (suppresses cache declarations for that round). */
   afterCompaction: boolean
-}
-
-function resultCallId(event: DerivationEvent): string | undefined {
-  const block = event.data?.message?.content?.find(candidate => candidate?.type === 'tool-result')
-  const id = block?.toolCallId
-  return typeof id === 'string' ? id : undefined
 }
 
 /**
@@ -282,7 +296,7 @@ export function deriveServingFacts(session: DerivationSession): ServingFacts {
         break
       }
       case 'tool/result': {
-        const callId = resultCallId(event)
+        const callId = toolResultCallId(event)
         if (callId !== undefined && pending.delete(callId) && pending.size === 0) {
           pauseSinceMs = undefined
           releaseAt = event.time

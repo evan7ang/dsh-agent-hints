@@ -7,10 +7,19 @@
 // imported at runtime.
 
 declare module '@deepseek-ai/cordis' {
-  /** Harness conversation message: provider-neutral role plus model-facing blocks. */
+  /**
+   * Harness conversation message: provider-neutral role plus model-facing
+   * blocks. Since harness 0.2.2 a tool result is a first-class `tool`-role
+   * message carrying `toolCallId` at the top level; earlier versions wrapped
+   * it in a `tool-result` content block on a user message.
+   */
   export interface HarnessMessage {
     id: string
-    role: 'system' | 'user' | 'assistant'
+    role: 'system' | 'user' | 'assistant' | 'tool'
+    /** `role: 'tool'`: provider-issued id of the answered tool call. */
+    toolCallId?: string
+    /** `role: 'tool'`: whether the invocation failed. */
+    isError?: boolean
     content: HarnessContentBlock[]
     source: Record<string, unknown>
   }
@@ -115,8 +124,17 @@ declare module '@deepseek-ai/cordis' {
       callId?: string
       /** `tool/call`: raw JSON arguments as produced by the model. */
       arguments?: string
-      /** `tool/result`: the result message whose content blocks carry the settled `toolCallId`. */
-      message?: { content?: Array<{ type?: string; toolCallId?: string }> }
+      /**
+       * `tool/result`: the settled result message. Current vocabulary:
+       * first-class tool-role message with a top-level `toolCallId`; legacy
+       * vocabulary: user message whose content blocks carry a `tool-result`
+       * block with the id.
+       */
+      message?: {
+        role?: string
+        toolCallId?: string
+        content?: Array<{ type?: string; toolCallId?: string }>
+      }
       /** `turn/end`: why the turn ended (`{kind: 'completed' | …}`). */
       reason?: { kind?: string }
     }

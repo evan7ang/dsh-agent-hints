@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // Field-by-field assertions over the requests captured from the real harness
-// runs (see run.sh): root turn 1 (probe → subagent delegation → final), the
-// spawned child (probe → final), and root turn 2 (adopted session, fresh
+// runs (see run.sh): root turn 1 (probe → background subagent spawn → final),
+// the spawned child (probe → final), root turn 2 (the runtime's background-
+// completion notice, same process), and root turn 3 (adopted session, fresh
 // process). Verifies session identity/lineage/call_index/epoch, the four-value
-// status (running/resume on the header, pause→running→finalize events), the
-// two-level dynamic priority, and the dynamic cache declaration (interval TTL,
-// wire-sized range, post-restart suppression).
+// status (running/resume on the header, pause→running events plus the
+// session-scoped disposal finalize), the two-level dynamic priority, and the
+// dynamic cache declaration (interval TTL, wire-sized range, post-restart
+// suppression).
 //
 // Usage: agent-hints-capture-check.mjs <capture.jsonl> [status-sink.jsonl]
 import { readFileSync, existsSync } from 'node:fs'
@@ -33,8 +35,8 @@ const decoded = hintEntries.map(entry => ({
 const rootItems = decoded.filter(item => item.hint.session.parent_session_id === undefined)
 const childItems = decoded.filter(item => item.hint.session.parent_session_id !== undefined)
 
-if (rootItems.length !== 4) {
-  fail(`expected 4 root main-line requests (probe call, delegation call, turn-1 final, turn-2 opening), got ${rootItems.length}`
+if (rootItems.length !== 5) {
+  fail(`expected 5 root main-line requests (probe, spawn, turn-1 final, turn-2 notice turn, turn-3 adopted opening), got ${rootItems.length}`
     + ` (${requests.length} total requests captured)`)
 }
 if (childItems.length !== 2) fail(`expected 2 child main-line requests (probe call + final), got ${childItems.length}`)
@@ -122,18 +124,22 @@ const ROOT_EXPECT = [
   { sessionId: rootId, epoch: 0, callIndex: 1, state: 'running', priority: USER_WAITING, ttlS: 600 },
   // First call after the probe release: resume (one-shot), continuation priority, interval-clamped TTL.
   { sessionId: rootId, epoch: 0, callIndex: 2, state: 'resume', priority: CONTINUATION, ttlS: 60 },
-  // First call after the delegation release: resume again.
+  // The subagent tool is background-only: its "started subagent <id>" ack settles the
+  // delegation call, so the next request is another one-shot resume.
   { sessionId: rootId, epoch: 0, callIndex: 3, state: 'resume', priority: CONTINUATION, ttlS: 60 },
-  // Turn 2 opening in a fresh process: running, user intervention, and the conservative
-  // signature-unknown suppression (call_index > 1 after a restart).
-  { sessionId: rootId, epoch: 0, callIndex: 4, state: 'running', priority: USER_WAITING, ttlS: undefined },
+  // Turn 2 is opened by the runtime's background-completion notice in the same
+  // process: a turn opening reports user-intervention priority by the two-level rule.
+  { sessionId: rootId, epoch: 0, callIndex: 4, state: 'running', priority: USER_WAITING, ttlS: 60 },
+  // Turn 3 opening in a fresh process (adopted session): running, user intervention,
+  // and the conservative signature-unknown suppression (call_index > 1 after a restart).
+  { sessionId: rootId, epoch: 0, callIndex: 5, state: 'running', priority: USER_WAITING, ttlS: undefined },
 ]
 roots.forEach((item, index) => verifyRequest(item, `root call ${index + 1}`, ROOT_EXPECT[index]))
 
 const children = byCallIndex(childItems)
 const CHILD_EXPECT = [
-  { sessionId: childId, epoch: 0, callIndex: 1, state: 'running', priority: USER_WAITING, ttlS: 600, parentSessionId: rootId, relation: 'spawn', join: 'sync' },
-  { sessionId: childId, epoch: 0, callIndex: 2, state: 'resume', priority: CONTINUATION, ttlS: 60, parentSessionId: rootId, relation: 'spawn', join: 'sync' },
+  { sessionId: childId, epoch: 0, callIndex: 1, state: 'running', priority: USER_WAITING, ttlS: 600, parentSessionId: rootId, relation: 'spawn', join: 'async' },
+  { sessionId: childId, epoch: 0, callIndex: 2, state: 'resume', priority: CONTINUATION, ttlS: 60, parentSessionId: rootId, relation: 'spawn', join: 'async' },
 ]
 children.forEach((item, index) => verifyRequest(item, `child call ${index + 1}`, CHILD_EXPECT[index]))
 
@@ -160,9 +166,13 @@ if (sinkPath !== undefined) {
   const rootEvents = eventsOf(rootId)
   const rootStates = statesOf(rootId)
   if (rootStates[0] !== 'pause') fail(`root status must open with the probe pause, got ${JSON.stringify(rootStates)}`)
+  // `finalize` is session-scoped (one per session lifetime, always the last
+  // event): the adopted root lives once per run, so the two runs contribute
+  // exactly one finalize each.
   if (rootStates.filter(state => state === 'finalize').length !== 2) {
-    fail(`root must finalize each of its two turns, got ${JSON.stringify(rootStates)}`)
+    fail(`root must finalize once per run (two process lifetimes), got ${JSON.stringify(rootStates)}`)
   }
+  if (rootStates.at(-1) !== 'finalize') fail(`root's finalize must be its last event, got ${JSON.stringify(rootStates)}`)
   const rootPauses = rootEvents.filter(event => event.agent_status.state === 'pause')
   if (rootPauses.length < 2) fail(`root must report the probe and delegation pauses, got ${rootPauses.length}`)
   if (rootPauses[0].agent_status.reason !== 'await_tool' || rootPauses[0].agent_status.tools?.[0]?.name !== 'e2e_probe') {
@@ -221,6 +231,6 @@ if (sinkPath !== undefined) {
 }
 
 console.log(`agent-hints-capture-check: PASS — ${hintEntries.length} hinted main-line requests`
-  + ` (root call_index 1→4 across a session adoption, child 1→2, running/resume, priority 3/1,`
-  + ` dynamic cache incl. post-restart suppression, spawn lineage with join sync)`
+  + ` (root call_index 1→5 across a background delegation and a session adoption, child 1→2, running/resume, priority 3/1,`
+  + ` dynamic cache incl. post-restart suppression, spawn lineage with join async)`
   + `, ${auxiliary} auxiliary request(s) without hint${sinkNote}`)

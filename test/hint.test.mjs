@@ -10,10 +10,17 @@ import { buildAgentHint, encodeAgentHintHeader, deriveServingFacts } from '../li
 const OPTIONS = { agentType: 'agent' }
 
 const call = (time, callId, name = 't') => ({ type: 'tool/call', time, data: { callId, name } })
+// Legacy vocabulary: user message carrying a tool-result content block.
 const result = (time, callId) => ({
   type: 'tool/result',
   time,
   data: { message: { content: [{ type: 'tool-result', toolCallId: callId }] } },
+})
+// Current vocabulary (harness ≥ 0.2.2): first-class tool-role message, top-level toolCallId.
+const toolMessageResult = (time, callId) => ({
+  type: 'tool/result',
+  time,
+  data: { message: { role: 'tool', toolCallId: callId, content: [{ type: 'text', text: 'ok' }] } },
 })
 const factsOf = events => deriveServingFacts({ ownEvents: () => events })
 
@@ -125,6 +132,19 @@ test('the first request after the pending set empties is a one-shot resume; the 
   const continuation = factsOf([...upToResume, { type: 'step/end', time: 7 }, { type: 'step/start', time: 8 }])
   assert.equal(continuation.state, 'running')
   assert.equal(continuation.stateSinceMs, 5, 'running since the release')
+})
+
+test('first-class tool-role result messages pair calls and release the pause (current harness vocabulary)', () => {
+  const facts = factsOf([
+    { type: 'turn/start', time: 0 },
+    { type: 'step/start', time: 1 },
+    { type: 'step/end', time: 2 },
+    call(3, 'c1'),
+    toolMessageResult(5, 'c1'),
+    { type: 'step/start', time: 6 },
+  ])
+  assert.equal(facts.state, 'resume')
+  assert.equal(facts.stateSinceMs, 5)
 })
 
 test('a turn boundary closes the resume window', () => {

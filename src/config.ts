@@ -44,9 +44,11 @@ export interface PluginConfig {
   priority: PriorityConfig
   /**
    * Cache control. `dynamic` (default): one `ephemeral` entry whose TTL is
-   * derived from the last request interval. A static array is a verbatim
-   * override (ephemeral only, explicit `ttl_s`, at most one entry). `omit`
-   * never sends the field.
+   * derived from the last request interval. A static array overrides the
+   * policy (ephemeral only, explicit `ttl_s`, at most one entry); an entry
+   * without an explicit `range` declares this request's wire message count
+   * (`{end: messages.length, unit: "message"}`) at send time. `omit` never
+   * sends the field.
    */
   cacheControl: CacheControlConfig
   /** Deployment thinking policy; `disabled` limits every conversation request to `off`. */

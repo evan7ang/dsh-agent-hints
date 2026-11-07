@@ -188,15 +188,24 @@ test('status sink activates only when configured and records the session lifecyc
     const { ctx, listeners } = fakeContext()
     apply(ctx, { baseURL: 'http://stub.local', apiKeyEnv: 'K' })
     assert.equal(listeners.filter(([event]) => event === 'session/event').length, 1, 'join tracking only')
+    assert.equal(listeners.filter(([event]) => event === 'session/disposed').length, 0, 'no disposal listener without a sink')
 
     const { ctx: ctx2, listeners: listeners2 } = fakeContext()
     apply(ctx2, { baseURL: 'http://stub.local', apiKeyEnv: 'K', statusSink: sink })
     const eventListeners = listeners2.filter(([event]) => event === 'session/event').map(([, listener]) => listener)
     assert.equal(eventListeners.length, 2, 'join tracking + status observer')
+    const disposedListeners = listeners2.filter(([event]) => event === 'session/disposed').map(([, listener]) => listener)
+    assert.equal(disposedListeners.length, 1, 'finalize rides session disposal')
     const observer = eventListeners[1]
     const s = { id: 's1', header: {}, ownEvents: () => [] }
     observer(s, { type: 'tool/call', time: 1, data: { name: 't', callId: 'c1' } })
     observer(s, { type: 'turn/end', time: 2, data: { reason: { kind: 'completed' } } })
+    assert.deepEqual(
+      readFileSync(sink, 'utf8').trim().split('\n').map(JSON.parse).map(line => line.agent_status.state),
+      ['pause'],
+      'a completed turn does not finalize — finalize is session-scoped',
+    )
+    disposedListeners[0](s)
     const lines = readFileSync(sink, 'utf8').trim().split('\n').map(JSON.parse)
     assert.deepEqual(lines.map(line => line.agent_status.state), ['pause', 'finalize'])
   } finally {

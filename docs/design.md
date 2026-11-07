@@ -74,7 +74,7 @@ apply(ctx, config)
 ├── when statusSink is set: StatusObserver   # out-of-band status channel (src/status.ts)
 │   ├── tool/call → {state:'tool', reason:'await_tool', tools:[all pending]}
 │   ├── tool/result → report {state:'running'} only when the pending set empties (parallel tools wait for the last)
-│   ├── turn/end(completed) → {state:'finalize'}   # one-shot headless task completion verdict; DSH `idle` is NOT mapped
+│   ├── turn/end → clear pending state only      # finalize is session-scoped since 2026-11-07: it rides `session/disposed` once per session lifetime (superseded, see §6); DSH `idle` is NOT mapped
 │   └── first sighting of a child session → bind child_session_id to the oldest unbound delegation of the parent
 └── ctx.llm.registerAdapter(['deepseek-hint'], HintedDeepSeekAdapter)
     ├── stream(options)                  # hint construction → header injection → fetch → SSE → StreamChunk
@@ -104,10 +104,11 @@ The hint lives in an HTTP header — model-invisible and absent from the durable
 ## 6. Known limits and future items
 
 - **Superseded (2026-11-04)**: the four-value `agent_status`, two-level dynamic `priority`, and dynamic `cache_control` designs in [20261104-01](design/20261104-01-simplified-scenario-fields.md) supersede the five-value state, static priority, and `pin` defaults described here.
+- **Superseded (2026-11-07)**: [20261107-01](design/20261107-01-session-scoped-finalize-and-cache-range-fill.md) supersedes the `finalize` trigger and the static-`cacheControl` "verbatim override": `finalize` is session-scoped and rides `session/disposed` (once per session lifetime, always the session's last event — never per turn); a static `cacheControl` entry without an explicit `range` declares the request's wire message count at send time.
 - **Protocol subset**: v1 is chat-completions only — text + tools + thinking + usage + abort; images/files are rejected explicitly; the messages protocol and image representation are future items. The subset must be kept in sync with the official adapter manually (the deployment target is a self-hosted gateway, so the subset is under control).
 - **Route coexistence**: `deepseek-hint` coexists with the official `deepseek-official`; switching the provider by mistake silently drops hints — the e2e wire assertions are the safety net.
 - `call_index`/`epoch`/`runningSinceMs` derive from the session log (restore replays), continuing across restarts; they depend on harness event semantics (`step/start` precedes dispatch, auxiliary calls do not enter a loop step) and must follow its evolution.
 - `derivation.join` reads the parent's most recent delegating call's `run_in_background` — parallel delegations share the latest value (accepted approximation); a child session's `child_session_id` binds to the parent's oldest unbound delegation (FIFO).
-- `finalize` uses `turn/end(completed)` as the completion verdict (one-shot headless task semantics); session-level endpoints for interactive profiles need a separate verdict. The status channel sink is a local JSONL file; after a gateway client replaces the `emit()` seam it owns retry/ordering semantics.
+- `finalize` rides `session/disposed` (session-scoped, once per session lifetime; superseded 2026-11-07 — it previously rode `turn/end(completed)`). The status channel sink is a local JSONL file; after a gateway client replaces the `emit()` seam it owns retry/ordering semantics.
 - `prediction` awaits a statistics engine; `fork_point` and framework-triggered handoff/suspend stay unemitted.
 - **Auxiliary calls on always-thinking models**: the adapter follows the official convention of forcing `thinking: {type: "disabled"}` on session-title calls. Gateways backed by always-thinking models reject that shape; the harness tolerates the failure (task unaffected, no generated title). Supporting gateway-specific thinking vocabularies (e.g. `low`/`high`/`max` only) would be an adapter-level policy change — future item.

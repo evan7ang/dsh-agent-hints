@@ -15,12 +15,14 @@
  * - `agent_status` follows the four-value contract: `running` by default,
  *   `pause` while a tool call is unanswered, `resume` on the first request
  *   after a release. `finalize` never rides the header (a completed run has no
- *   closing request) — it rides the `turn/end` status event;
+ *   closing request) — it rides the `session/disposed` status event, once per
+ *   session lifetime (session-scoped, never per turn);
  * - `priority` is the dynamic two-level value by default (turn opening =
  *   3/`user_waiting`, otherwise 1/`critical_path`); a static config is folded
  *   into {1, 3}; `null` omits the field;
  * - `cache_control` is one dynamic `ephemeral` entry with a derived TTL by
- *   default; a static array is a verbatim override; `null` omits it;
+ *   default; a static array overrides the policy (type/ttl), with an absent
+ *   `range` filled from the request's wire message count; `null` omits it;
  * - `prediction` rides the header only when `predictionTrie`/`predictionStatic`
  *   is configured.
  * The request body keeps the provider's original format and NEVER carries
@@ -169,6 +171,9 @@ export function apply(ctx: Context, config?: unknown): void {
       for (const sink of sinks) sink(event)
     }, subagentTools)
     ctx.on('session/event', (session: SessionLike, event: SessionEventLike) => observer.onEvent(session, event))
+    // `finalize` is session-scoped: the disposal is the session's end of
+    // life, so it carries the completion verdict — never `turn/end`.
+    ctx.on('session/disposed', (session: SessionLike) => observer.onDispose(session))
   }
 
   const resolveApiKey = async (): Promise<string> => {

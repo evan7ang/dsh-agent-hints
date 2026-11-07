@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 // Unit tests for the out-of-band status channel: the folded four-value
 // lifecycle (pause on tool calls, running on the last parallel result),
-// subagent naming and child binding, finalize on turn completion, and the
-// sinks — running against the committed built JS (lib/).
+// subagent naming and child binding, session-scoped finalize on disposal,
+// and the sinks — running against the committed built JS (lib/).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -21,6 +21,13 @@ function harness(subagentToolNames = ['subagent']) {
   return { observer, events }
 }
 
+// Current harness vocabulary: the settled result is a first-class tool-role
+// message with a top-level toolCallId. The legacy vocabulary (user message
+// carrying a tool-result content block) is covered by a dedicated test.
+function result(time, callId) {
+  return { type: 'tool/result', time, data: { message: { role: 'tool', toolCallId: callId, content: [{ type: 'text', text: 'ok' }] } } }
+}
+
 test('tool/call reports pause pinned to the episode start; running only after the LAST parallel result', () => {
   const { observer, events } = harness()
   const s = session('s1')
@@ -34,10 +41,18 @@ test('tool/call reports pause pinned to the episode start; running only after th
   assert.equal(events.at(-1).agent_status.state_since_ms, 10, 'the second call keeps the episode start')
   assert.equal(events.at(-1).agent_status.tools.length, 2)
 
-  observer.onEvent(s, { type: 'tool/result', time: 12, data: { message: { content: [{ type: 'tool-result', toolCallId: 'c1' }] } } })
+  observer.onEvent(s, result(12, 'c1'))
   assert.equal(events.length, 2, 'running waits for the last result')
-  observer.onEvent(s, { type: 'tool/result', time: 13, data: { message: { content: [{ type: 'tool-result', toolCallId: 'c2' }] } } })
+  observer.onEvent(s, result(13, 'c2'))
   assert.deepEqual(events.at(-1).agent_status, { state: 'running', state_since_ms: 13 })
+})
+
+test('legacy tool-result content blocks still pair calls (older harness vocabulary)', () => {
+  const { observer, events } = harness()
+  const s = session('s1')
+  observer.onEvent(s, { type: 'tool/call', time: 10, data: { name: 'probe_tool', callId: 'c1' } })
+  observer.onEvent(s, { type: 'tool/result', time: 11, data: { message: { content: [{ type: 'tool-result', toolCallId: 'c1' }] } } })
+  assert.deepEqual(events.map(event => event.agent_status.state), ['pause', 'running'])
 })
 
 test('delegation calls are named agent:<tool> and bind child_session_id on first child sighting', () => {
@@ -53,19 +68,40 @@ test('delegation calls are named agent:<tool> and bind child_session_id on first
 
   // A second child sighting must not re-bind.
   const before = events.length
-  observer.onEvent(session('child', { parentSession: 'parent', origin: 'subagent' }), { type: 'tool/result', time: 12, data: { message: { content: [] } } })
+  observer.onEvent(session('child', { parentSession: 'parent', origin: 'subagent' }), { type: 'tool/result', time: 12, data: { message: { role: 'tool', content: [] } } })
   assert.equal(events.length, before, 'bound entries are not re-reported')
 })
 
-test('turn completion reports finalize and clears pending state', () => {
+test('a completed turn reports no finalize; disposal finalizes exactly once as the last event', () => {
   const { observer, events } = harness()
   const s = session('s1')
   observer.onEvent(s, { type: 'tool/call', time: 10, data: { name: 't', callId: 'c1' } })
   observer.onEvent(s, { type: 'turn/end', time: 11, data: { reason: { kind: 'completed' } } })
+  assert.deepEqual(events.map(event => event.agent_status.state), ['pause'],
+    'finalize is session-scoped: a completed turn only clears the pending state')
+  // A second completed turn still emits nothing (multi-turn sessions finalize once).
+  observer.onEvent(s, { type: 'turn/end', time: 12, data: { reason: { kind: 'completed' } } })
+  assert.equal(events.length, 1)
+  observer.onDispose(s)
   assert.deepEqual(events.map(event => event.agent_status.state), ['pause', 'finalize'])
-  // Completed sessions must not leak later reports.
-  observer.onEvent(s, { type: 'tool/result', time: 12, data: { message: { content: [{ type: 'tool-result', toolCallId: 'c1' }] } } })
+  assert.equal(events.at(-1).agent_status.state, 'finalize', 'finalize is the session\u2019s last event')
+  // Disposed sessions must not leak later reports.
+  observer.onEvent(s, result(13, 'c1'))
   assert.equal(events.length, 2)
+})
+
+test('disposal clears pending state without reporting running first', () => {
+  const { observer, events } = harness()
+  const s = session('s1')
+  observer.onEvent(s, { type: 'tool/call', time: 10, data: { name: 't', callId: 'c1' } })
+  observer.onDispose(s)
+  assert.deepEqual(events.map(event => event.agent_status.state), ['pause', 'finalize'])
+})
+
+test('a session with no tool waits still finalizes on disposal (header-only sessions need the release signal)', () => {
+  const { observer, events } = harness()
+  observer.onDispose(session('s1'))
+  assert.deepEqual(events.map(event => event.agent_status.state), ['finalize'])
 })
 
 test('non-completed turn ends report no finalize but still clear pending state', () => {
@@ -74,7 +110,7 @@ test('non-completed turn ends report no finalize but still clear pending state',
   observer.onEvent(s, { type: 'tool/call', time: 9, data: { name: 't', callId: 'c1' } })
   observer.onEvent(s, { type: 'turn/end', time: 10, data: { reason: { kind: 'aborted', reason: 'user' } } })
   assert.equal(events.length, 1, 'no finalize for an aborted turn')
-  observer.onEvent(s, { type: 'tool/result', time: 12, data: { message: { content: [{ type: 'tool-result', toolCallId: 'c1' }] } } })
+  observer.onEvent(s, result(12, 'c1'))
   assert.equal(events.length, 1, 'the pending set was cleared at the turn boundary')
 })
 

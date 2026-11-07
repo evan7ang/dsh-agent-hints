@@ -26,9 +26,9 @@ x-agent-hint: eyJzZXNzaW9uIjp7InNlc3Npb25faWQi…   ← UTF-8 JSON AgentHint 的
 
 - **仅主请求发射**：辅助调用（`compaction` / `session-title` purpose）与无会话身份的请求不加头。
 - `strict_priority` **永不发送**（可信控制面字段）。
-- `agent_status` 遵循四值契约：默认 `running`；存在未应答的工具调用时 `pause`（按本部署裁决，任何工具调用都视为在等外部结果）；放行后的第一条请求 `resume`（只报一条）。`finalize` 不上 header——跑完一轮没有收尾请求——由 `turn/end(completed)` 状态事件承载。
+- `agent_status` 遵循四值契约：默认 `running`；存在未应答的工具调用时 `pause`（按本部署裁决，任何工具调用都视为在等外部结果）；放行后的第一条请求 `resume`（只报一条）。`finalize` 不上 header——跑完一轮没有收尾请求——它是会话级语义（会话结束、释放会话级资源），由 `session/disposed` 状态事件承载，每个会话生命周期恰好一条且为该会话最后一条事件。
 - `priority` 默认动态二值：turn 开局请求 = 用户介入（`3` / `user_waiting`），其余为自驱续接（`1` / `critical_path`）。静态 `{level, reason}` 为常量覆盖并折叠进 `{1, 3}`；`null` 省略字段。
-- `cache_control` 默认单条动态 `ephemeral`：`range.end` 为本次 wire 消息条数，`ttl_s = clamp(最近间隔 × 2, 60, 3600)`。压缩当轮、模型/工具集变化、前缀估算不足 128 token 时抑制声明。静态数组为逐字覆盖（仅 `ephemeral`、显式 `ttl_s`）；`null` 省略。
+- `cache_control` 默认单条动态 `ephemeral`：`range.end` 为本次 wire 消息条数，`ttl_s = clamp(最近间隔 × 2, 60, 3600)`。压缩当轮、模型/工具集变化、前缀估算不足 128 token 时抑制声明。静态数组覆盖策略（仅 `ephemeral`、显式 `ttl_s`）；条目未显式给 `range` 时按本次 wire 消息条数补 `range.end` + `unit: message`。`null` 省略。
 - `prediction` 在配置了来源时随同一头发射（`predictionTrie` 和/或 `predictionStatic`）；未配置来源时整块省略，wire 形状不变。取值来自离线 trie（工具序列最长前缀匹配），逐字段静态回退。
 - 身份信号与官方适配器对齐：`x-deepseek-harness-session-id`（有会话 id 时）与 `x-deepseek-harness-compact: 1`（compaction 时）照发。
 
@@ -95,7 +95,7 @@ API key 逐请求解析：credentials 服务优先（`$DSH_HOME/.credentials.yam
 | `apiKeyEnv` | string | 继承 `$DEEPSEEK_API_KEY_ENV` → `DEEPSEEK_API_KEY` | 逐请求解析的环境变量名（credentials 服务优先） |
 | `agentType` | string | `agent` | 上报为 `session.agent_type` |
 | `priority` | `"dynamic"`、`{level, reason}` 或 `null` | `"dynamic"` | 二值软优先级。动态：开局请求 `3`/`user_waiting`，其余 `1`/`critical_path`。静态对象折叠进 `{1, 3}`；`null` 省略字段 |
-| `cacheControl` | `"dynamic"`、数组或 `null` | `"dynamic"` | 动态：单条 `ephemeral` + 推导 TTL。静态数组为逐字覆盖（仅 `ephemeral`、显式 `ttl_s`、至多一条）；`null` 省略字段 |
+| `cacheControl` | `"dynamic"`、数组或 `null` | `"dynamic"` | 动态：单条 `ephemeral` + 推导 TTL。静态数组覆盖策略（仅 `ephemeral`、显式 `ttl_s`、至多一条）；条目未给 `range` 时按本次 wire 消息条数声明。`null` 省略字段 |
 | `thinking` | `"enabled"` / `"disabled"` | enabled | `disabled` 将所有会话请求的 thinking 限制为 `off` |
 | `reasoningEffort` | `"off"/"low"/"high"/"max"` | `high` | 请求未携带时的默认推理力度 |
 | `models` | `{id, name, contextWindow, maxTokens}[]` | DeepSeek-V4 家族目录 | `resolveModel` 的咨询模型目录；**指向自有网关时必须提供真实限额**（供 compaction 决策使用） |

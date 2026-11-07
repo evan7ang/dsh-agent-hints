@@ -58,6 +58,30 @@ test('serializeRequest maps system/user/assistant/tool-result messages to the wi
   assert.equal('agent_hints' in wire, false, 'body must never carry hint fields')
 })
 
+test('serializeRequest maps first-class tool-role messages to wire tool entries (current harness vocabulary)', () => {
+  const wire = serializeRequest(
+    {
+      provider: 'p',
+      model: 'm',
+      messages: [
+        message('assistant', [{ type: 'tool-call', id: 'call-1', name: 'probe_tool', arguments: '{}' }]),
+        { id: 'm-1', role: 'tool', toolCallId: 'call-1', content: [textBlock('tool out')], source: { kind: 'tool', callId: 'call-1' } },
+        { id: 'm-2', role: 'tool', toolCallId: 'call-2', content: [], source: { kind: 'tool', callId: 'call-2' } },
+      ],
+    },
+    CONFIG,
+  )
+  assert.deepEqual(wire.messages, [
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'probe_tool', arguments: '{}' } }],
+    },
+    { role: 'tool', tool_call_id: 'call-1', content: 'tool out' },
+    { role: 'tool', tool_call_id: 'call-2', content: '(no output)' },
+  ])
+})
+
 test('serializeRequest omits empty user messages that only carry tool results and pads empty tool output', () => {
   const wire = serializeRequest(
     {
@@ -354,7 +378,7 @@ test('a compaction rewrite suppresses the declaration for that round', async () 
   }
 })
 
-test('static cacheControl is sent verbatim; null omits the field', async () => {
+test('static cacheControl overrides the policy; an absent range follows the wire size, an explicit range is respected; null omits the field', async () => {
   const fetchCapture = hintCapturingFetch()
   try {
     const staticConfig = normalizeConfig({
@@ -364,12 +388,29 @@ test('static cacheControl is sent verbatim; null omits the field', async () => {
     })
     const { adapter } = makeAdapter({ config: staticConfig })
     await collect(adapter.stream({ ...MAIN_OPTIONS, sessionId: 's1', messages: LONG_MESSAGES }))
-    assert.deepEqual(decodeHint(fetchCapture.captured[0]).cache_control, [{ type: 'ephemeral', ttl_s: 120 }])
+    assert.deepEqual(decodeHint(fetchCapture.captured[0]).cache_control, [{
+      type: 'ephemeral',
+      ttl_s: 120,
+      range: { end: fetchCapture.captured[0].body.messages.length, unit: 'message' },
+    }], 'a declaration without a range pins nothing locatable — the range follows the request')
+
+    const rangedConfig = normalizeConfig({
+      baseURL: 'http://stub.local',
+      apiKeyEnv: 'K',
+      cacheControl: [{ type: 'ephemeral', ttl_s: 120, range: { end: 2, unit: 'message' } }],
+    })
+    const { adapter: ranged } = makeAdapter({ config: rangedConfig })
+    await collect(ranged.stream({ ...MAIN_OPTIONS, sessionId: 's1', messages: LONG_MESSAGES }))
+    assert.deepEqual(decodeHint(fetchCapture.captured[1]).cache_control, [{
+      type: 'ephemeral',
+      ttl_s: 120,
+      range: { end: 2, unit: 'message' },
+    }], 'an explicitly configured range is respected verbatim')
 
     const omitConfig = normalizeConfig({ baseURL: 'http://stub.local', apiKeyEnv: 'K', cacheControl: null })
     const { adapter: omitted } = makeAdapter({ config: omitConfig })
     await collect(omitted.stream({ ...MAIN_OPTIONS, sessionId: 's2', messages: LONG_MESSAGES }))
-    assert.equal('cache_control' in decodeHint(fetchCapture.captured[1]), false)
+    assert.equal('cache_control' in decodeHint(fetchCapture.captured[2]), false)
   } finally {
     fetchCapture.restore()
   }

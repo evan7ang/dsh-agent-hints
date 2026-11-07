@@ -5,14 +5,15 @@
 //
 //   root session, turn 1
 //     1. e2e_probe tool call            → exercises running + turn-opening priority
-//     2. subagent(foreground) tool call → exercises spawn lineage + parent pause
-//   child session (spawned by the harness)
+//     2. subagent(background) tool call → spawn lineage; the ack settles the call
+//     3. final text                     → parent resume after the ack release
+//   child session (spawned by the harness, runs concurrently)
 //     1. e2e_probe tool call            → child running + priority
 //     2. final text                     → child resume after the probe release
-//   root session, turn 1 (continued)
-//     3. final text                     → parent resume after the delegation release
-//   root session, turn 2 (adopted via --session-id in run.sh)
-//     4. final text                     → new-turn opening after a process restart
+//   root session, turn 2 (the runtime's background-completion notice)
+//     4. final text                     → new-turn opening in the same process
+//   root session, turn 3 (adopted via --session-id in run.sh)
+//     5. final text                     → new-turn opening after a process restart
 //
 // Scripting is stateful per session id decoded from the `X-Agent-Hint` header.
 // Auxiliary calls (session-title/compaction) carry no hint and always get plain
@@ -101,10 +102,14 @@ function scriptFor(hint, body) {
   }
   if (phase === 1) return toolCallResponse('hint-e2e-call-1', 'e2e_probe', { message: 'START' })
   if (phase === 2) {
+    // The subagent tool is background-only in the current harness: it returns
+    // a "started subagent <id>" acknowledgement immediately and the child's
+    // completion arrives later as an inbox notice opening a new turn. The
+    // argument documents the declared intent the plugin's join tracking reads.
     return toolCallResponse('hint-e2e-call-2', 'subagent', {
       description: 'probe subagent',
       prompt: 'Call the e2e_probe tool with message CHILD, then report the result.',
-      run_in_background: false,
+      run_in_background: true,
     })
   }
   return textResponse('AGENT_HINTS_E2E_FINAL')

@@ -74,7 +74,7 @@ apply(ctx, config)
 ├── statusSink 配置时：StatusObserver     # 带外状态通道（src/status.ts）
 │   ├── tool/call → {state:'tool', reason:'await_tool', tools:[全部未决]}
 │   ├── tool/result → 未决清空才报 {state:'running'}（并行工具等最后一个）
-│   ├── turn/end(completed) → {state:'finalize'}   # 一次性 headless 任务完成判定；不映射 DSH idle
+│   ├── turn/end → 仅清未决状态                    # finalize 自 2026-11-07 起为会话级：由 `session/disposed` 承载、每会话生命周期一条（已被取代，见 §6）；不映射 DSH idle
 │   └── 子会话首现 → 绑定 child_session_id 到父会话最老未决委托
 └── ctx.llm.registerAdapter(['deepseek-hint'], HintedDeepSeekAdapter)
     ├── stream(options)                  # hint 构造 → header 注入 → fetch → SSE → StreamChunk
@@ -104,10 +104,11 @@ hint 在 HTTP 头里、模型不可见、session log 不记录，**wire 证据�
 ## 6. 已知边界与后续项
 
 - **已被取代（2026-11-04）**：四值 `agent_status`、二值动态 `priority`、动态 `cache_control` 的设计见 [20261104-01](design/20261104-01-simplified-scenario-fields.md)，取代本文描述的五值状态、静态 priority 与 `pin` 默认值。
+- **已被取代（2026-11-07）**：[20261107-01](design/20261107-01-session-scoped-finalize-and-cache-range-fill.md) 取代本文的 `finalize` 触发源与静态 `cacheControl`「逐字覆盖」描述：`finalize` 为会话级语义，由 `session/disposed` 承载（每会话生命周期恰好一条、恒为该会话最后一条事件，不按轮次发送）；静态 `cacheControl` 条目未显式给 `range` 时按本次 wire 消息条数声明。
 - **协议子集**：v1 仅 chat-completions——text+tools+thinking+usage+abort；images/files 显式拒绝，messages 协议、图片表示为后续项——子集需手动跟进官方适配器演进（部署目标是自有网关，子集可控）。
 - **路由并存**：`deepseek-hint` 与官方 `deepseek-official` 并存，误切 provider 会静默失去 hint——e2e wire 断言兜底。
 - `call_index`/`epoch`/`runningSinceMs` 派生自会话日志（restore 重放），重启续接；依赖 harness 事件语义（`step/start` 前置于派发、辅助调用不进 loop step），演进需跟进。
 - `derivation.join` 取父会话最近一次委托调用的 `run_in_background`——并行委托共享最新值（可接受近似）；子会话 `child_session_id` 绑定为父会话最老未决委托（FIFO）。
-- `finalize` 以 `turn/end(completed)` 为完成判定（一次性 headless 任务语义）；交互式 profile 的会话级终点需另行判定。状态通道 sink 为本地 JSONL，网关客户端替换 `emit()` 接缝后接管重试/顺序语义。
+- `finalize` 由 `session/disposed` 承载（会话级，每会话生命周期一条；2026-11-07 起取代原 `turn/end(completed)` 触发源）。状态通道 sink 为本地 JSONL，网关客户端替换 `emit()` 接缝后接管重试/顺序语义。
 - `prediction` 待统计引擎；`fork_point`、handoff/suspend 框架触发保持不发射。
 - **始终思考模型的辅助调用**：适配器遵循官方约定，session-title 调用固定 `thinking: {type: "disabled"}`。以始终思考模型为后端的网关会拒绝该形态；harness 容忍该失败（任务不受影响、无生成标题）。支持网关特有思考档位词表（如仅 `low`/`high`/`max`）属适配器层策略变更——后续项。

@@ -11,8 +11,8 @@ src/
 │                       #   错误码映射、X-Agent-Hint 头注入
 ├── config.ts           # normalizeConfig：agent-hints 行配置的校验与归一化
 ├── hint.ts             # AgentHint 计算：会话身份、call_index/epoch、优先级与缓存控制词汇
-├── status.ts           # 带外状态通道：会话日志派生事件（tool/running/finalize），
-│                       #   JSONL statusSink 发射
+├── status.ts           # 带外状态通道：会话事件派生 pause/running，session/disposed 承载
+│                       #   会话级 finalize（每生命周期一条）；JSONL statusSink 发射
 test/                   # node --test 单元测试（对 lib/ 构建产物运行）
 ├── adapter.test.mjs    # 适配器 wire 行为
 ├── apply.test.mjs      # 配置归一化与插件接线

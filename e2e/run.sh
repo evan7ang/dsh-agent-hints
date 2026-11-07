@@ -6,9 +6,10 @@
 # `deepseek-hint`) against a local SSE capture stub, and drives two headless
 # runs through the real harness:
 #
-#   run 1: e2e_probe tool round trip → foreground `subagent` delegation
-#          (the child does its own probe round trip) → parent final answer
-#   run 2: `--session-id` adopts the same session, opening a second user turn
+#   run 1: e2e_probe tool round trip → background `subagent` delegation (the
+#          ack settles the call; the child does its own probe round trip and
+#          its completion notice opens a second turn) → parent final answer
+#   run 2: `--session-id` adopts the same session, opening a third turn
 #
 # The capture assertions then verify every AgentHint field end to end:
 # session identity/lineage/call_index/epoch, the four-value status
@@ -69,14 +70,13 @@ $DSH --profile "$PROFILE" --dump-config 2> /dev/null | grep -q "^- id: agent-hin
 $DSH --profile "$PROFILE" --dump-config 2> /dev/null | grep -q "name: dsh-agent-hints"
 echo "  agent-hints row mounted"
 
-echo "== [3/7] model binding + wire overlay"
-printf 'agent-default-model:\n  provider: deepseek-hint\n  model: deepseek-flash\n' > "$DSH_HOME/settings.yaml"
+echo "== [3/7] wire overlay (model binding rides the overlay — settings.yaml is import-once)"
 sed -e "s|__STUB_BASE_URL__|$STUB_URL|" \
     -e "s|__STATUS_SINK__|$SCRATCH/status.jsonl|" \
     -e "s|__FIXTURE_TOOL__|$ROOT/e2e/fixture-tool.mjs|" \
     "$ROOT/e2e/e2e.patch.yml" > "$SCRATCH/patch.yml"
 
-echo "== [4/7] headless run 1: probe round trip + foreground subagent delegation"
+echo "== [4/7] headless run 1: probe round trip + background subagent delegation"
 set +e
 AGENT_HINTS_E2E_API_KEY=sk-agent-hints-e2e-dummy \
   $DSH --profile "$PROFILE" --patch "$SCRATCH/patch.yml" --json \
@@ -102,7 +102,7 @@ for (const line of fs.readFileSync(process.argv[1], "utf8").split("\n")) {
 [ -n "$SESSION_ID" ] || { echo "run 1 emitted no session id" >&2; exit 1; }
 echo "  run 1 completed (exit 0, session $SESSION_ID)"
 
-echo "== [5/7] headless run 2: adopt the session and open a second turn"
+echo "== [5/7] headless run 2: adopt the session and open a third turn"
 set +e
 AGENT_HINTS_E2E_API_KEY=sk-agent-hints-e2e-dummy \
   $DSH --profile "$PROFILE" --patch "$SCRATCH/patch.yml" --json --session-id "$SESSION_ID" \
@@ -119,8 +119,9 @@ grep -q 'AGENT_HINTS_E2E_FINAL' "$SCRATCH/run2.jsonl"
 echo "  run 2 completed (exit 0, adopted session, second turn)"
 
 echo "== [6/7] assert the captured wire fields and status events"
-# The HTTP sink delivers asynchronously; wait for the turn-2 finalize to land
-# (three finalize events: child turn, root turn 1, root turn 2).
+# The HTTP sink delivers asynchronously; wait for the run-2 finalize to land
+# (three session-scoped finalize events: child + root disposals in run 1,
+# root disposal in run 2).
 for _ in $(seq 1 80); do
   if [ -f "$SCRATCH/status-http.jsonl" ] \
     && [ "$(grep -c '"finalize"' "$SCRATCH/status-http.jsonl" 2> /dev/null || true)" -ge 3 ]; then

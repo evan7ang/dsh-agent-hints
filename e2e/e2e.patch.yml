@@ -5,10 +5,15 @@
 # plugin exports no schemastery schema). `statusAuto: true` derives the status
 # endpoint from baseURL's origin (<origin>/agent-status, the Motor-coordinator
 # convention; the stub serves POST /agent-status) and composes with the JSONL
-# file sink.
+# file sink. The model binding rides the overlay: settings.yaml is a one-shot
+# import at profile creation (DSH ≥ 2.0), so a later write never takes effect.
 - insert:
     - id: dsh-agent-hints-e2e-probe
       name: __FIXTURE_TOOL__
+- id: agent-default-model
+  config:
+    provider: deepseek-hint
+    model: deepseek-flash
 - id: agent-hints
   config:
     baseURL: __STUB_BASE_URL__

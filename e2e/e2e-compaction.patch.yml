@@ -5,6 +5,10 @@
 - insert:
     - id: dsh-agent-hints-e2e-probe
       name: __FIXTURE_TOOL__
+- id: agent-default-model
+  config:
+    provider: deepseek-hint
+    model: deepseek-flash
 - id: agent-hints
   config:
     baseURL: __STUB_BASE_URL__

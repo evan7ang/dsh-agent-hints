@@ -3,8 +3,15 @@
  * Out-of-band status event channel: the agent
  * framework reports lifecycle state transitions — `pause` (awaiting tool
  * executions; every tool call counts as "waiting on something external"),
- * `running` (back to generation), `finalize` (task completion) — as state
+ * `running` (back to generation), `finalize` (session end) — as state
  * events, separate from the per-request `X-Agent-Hint` header.
+ *
+ * `finalize` is SESSION-scoped (RFC §3.3): it means "this session is over,
+ * session-level resources may be released" (consumers drop session-affinity
+ * pins on it). It therefore fires exactly once per session from
+ * `session/disposed` — never per turn. A multi-turn session emits one
+ * `finalize` at the end of its lifetime, and it is always that session's
+ * last event (no events follow a disposal).
  *
  * The four-value contract folds `tool` into `pause` at the sender, so no
  * `tool` state ever reaches the wire; diagnostics (`reason`, `tools[]`,
@@ -30,6 +37,7 @@
 
 import { appendFileSync } from 'node:fs'
 import type { SessionEventLike, SessionLike } from '@deepseek-ai/cordis'
+import { toolResultCallId } from './hint.js'
 
 /** One wire status event (the event channel carries the folded four-value vocabulary minus `resume`, which is request-scoped). */
 export interface StatusEvent {
@@ -154,7 +162,7 @@ export class StatusObserver {
       return
     }
     if (event.type === 'tool/result') {
-      const callId = event.data?.message?.content?.find(block => block?.type === 'tool-result')?.toolCallId
+      const callId = toolResultCallId(event)
       if (callId === undefined) return
       const calls = this.pendingOf(session.id)
       if (!calls.delete(callId)) return
@@ -170,17 +178,30 @@ export class StatusObserver {
       return
     }
     if (event.type === 'turn/end') {
-      // A finished turn cannot leave live tool waits behind; only a completed
-      // turn is a task completion (DSH's `agent/status` `idle` is NOT finalize).
+      // A finished turn cannot leave live tool waits behind. A completed turn
+      // is NOT finalize: `finalize` is session-scoped and fires from
+      // `session/disposed` (see `onDispose`); DSH's `agent/status` `idle` is
+      // not finalize either.
       this.pending.delete(session.id)
       this.pauseSince.delete(session.id)
-      if (event.data?.reason?.kind === 'completed') {
-        this.emit({
-          session: { session_id: session.id },
-          agent_status: { state: 'finalize', state_since_ms: event.time },
-        })
-      }
     }
+  }
+
+  /**
+   * Session teardown: the one and only `finalize` trigger. The disposal is
+   * the session's end of life (store retirement), so the event is always the
+   * session's last — exactly one per session lifetime. Sessions that never
+   * close legitimately never finalize; header-only sessions (requests but no
+   * tool waits) still need the release signal, so disposal finalizes every
+   * session unconditionally.
+   */
+  onDispose(session: SessionLike): void {
+    this.pending.delete(session.id)
+    this.pauseSince.delete(session.id)
+    this.emit({
+      session: { session_id: session.id },
+      agent_status: { state: 'finalize', state_since_ms: Date.now() },
+    })
   }
 
   private pendingOf(sessionId: string): Map<string, PendingCall> {
