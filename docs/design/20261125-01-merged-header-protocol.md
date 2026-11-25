@@ -92,7 +92,7 @@ AgentHint 对象 → UTF-8 JSON → base64url（无 padding）→ X-Agent-Hint �
 
 ## 5. 传输
 
-- **Chat**：自实现适配器；header 直接写入；保留 dsh-agenthint 的流合同（终态前 block-end、工具身份先校验、严格 usage、idle watchdog、错误分类），并吸收本仓的空工具输出占位与上下文超窗识别。
+- **Chat**：自实现适配器；header 直接写入；保留 dsh-agenthint 的流合同（终态前 block-end、工具身份先校验、严格 usage、idle watchdog、错误分类），并吸收本仓的空工具输出占位、上下文超窗识别，以及与官方一致的 `x-deepseek-harness-session-id` / `x-deepseek-harness-compact` 身份头（非 hint 字段）。
 - **Messages**：扩展官方 `DeepSeekAdapter`；官方无 per-request header 钩子，使用 AsyncLocalStorage + `resolveAuth` 的 headers 展开注入。`prepareExtensions` 不贡献任何字段，只保留 accept 记账。该接缝依赖官方实现细节，升级宿主需复核。
 
 ## 6. 配置

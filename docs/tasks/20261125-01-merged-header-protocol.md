@@ -30,7 +30,22 @@
 - 类型检查：`tsc -b --force` 0 error。
 - 构建：`tsc -b` + `esbuild` 生成 `lib/types/*` 与 `lib/client.js`。
 - 单测：24 个测试文件 / 236 项通过（`vitest run`），`node --test tests/trace.test.mjs` 21 项通过；其中 Messages 传输的并发 hint 隔离由 Loader 集成测试覆盖。
-- e2e：`bash e2e/run.sh` 全部断言通过。观测到的 header：普通请求 `state=start` / `append`，priority 3/1，cache `ttl_s=600`、`msg_offset=4`；manage `resume`（prefetch）+ 退出时 `stop`（evict，派发后在退出竞争中被取消，stub 未收到，trace 可证）。
+- e2e：`bash e2e/run.sh` 全部断言通过。两轮 headless、每轮一次真实工具往返（`e2e_probe`），观测到的 wire 时间线：
+
+  | 顺序 | state | call_index | epoch | priority | cache | wire msgs |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 1 | start | 1 | 0 | 3/user_waiting | 600s@4 | 4 |
+  | 2 | append | 2 | 0 | 1/critical_path | 60s@6 | 6 |
+  | 3 | resume(manage) | 3 | 0 | — | — | 0 |
+  | 4 | append | 3 | 0 | 3/user_waiting | 抑制（新进程签名未知） | 8 |
+  | 5 | append | 4 | 0 | 1/critical_path | 60s@10 | 10 |
+
+  另断言：`start` 仅一次；`msg_offset` 等于本请求 wire 消息数；`resume` 先于收养会话的首条普通请求；标题请求无 hint；body 零 hint；`stop` 已派发且携带最后一条主线调用序号（run 2 为 4）。
+- e2e 三阶段（脚本化 mock）：
+  - Phase B（子代理）：父会话 start→append→append 后空闲；子会话 start 被接受后父会话 `pause`(offload)；子会话处置 `stop`(evict) 已送达；通知轮 `resume`(prefetch) 先于父会话的新一轮 `append`（priority 回到 3）。
+  - Phase C（上下文压力）：provider 返回超窗错误 → 摘要请求（无 hint，带 `x-deepseek-harness-compact`）→ `compact`(evict，旧 epoch 0) → 重试步骤保持 call_index 2、epoch 1、cache 抑制 → 下一次续接 epoch 1、cache 恢复。
+- 修复：`stop` 在会话已离开 store 后此前回退为 `call_index=1`；现缓存每个会话最后一次推导的事实，manage 请求在会话缺失时使用该缓存。
+- 修复：chat 适配器恢复与官方一致的 `x-deepseek-harness-session-id` / `x-deepseek-harness-compact` 身份头（非 hint），使压缩摘要等辅助请求可被识别。
 - 已知限制：
   - Motor 未跟进时 manage 请求会被现有入口 400 拒绝，优先级准入不生效。
   - 进程退出时 `stop` 可能丢失。
