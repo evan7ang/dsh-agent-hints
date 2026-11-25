@@ -3,7 +3,7 @@ import { SESSION_FORMAT_VERSION, SessionId, SessionSeq } from '@deepseek-ai/dsh-
 import type { Session } from '@deepseek-ai/dsh-session'
 import { ControlBarrierError, DEFAULT_QUARANTINE_TTL_MS, LifecycleBridge } from '../src/lifecycle-bridge.ts'
 import type { SessionControlClient } from '../src/control-client.ts'
-import type { SessionControlVerb } from '../src/types.ts'
+import type { ManageState } from '../src/hint.ts'
 
 const SID = SessionId('session-quarantine')
 const OTHER = SessionId('session-other')
@@ -37,7 +37,7 @@ async function settle(): Promise<void> {
  */
 function unknownClient(): SessionControlClient {
   return {
-    send: (verb: SessionControlVerb) =>
+    send: (verb: ManageState) =>
       Promise.resolve(verb === 'pause' || verb === 'stop' || verb === 'compact'
         ? { status: 'unknown' as const, dispatched: true }
         : { status: 'accepted' as const, httpStatus: 200 }),

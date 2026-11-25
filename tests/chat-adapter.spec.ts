@@ -127,6 +127,28 @@ describe('ChatCompletionsAdapter', () => {
     expect((body['tools'] as { function: { name: string } }[])[0]?.function.name).toBe('read')
   })
 
+  it('sends the official identity metadata and marks compaction requests', async () => {
+    const { baseURL, receivedHeaders } = await serve([
+      { choices: [{ delta: { content: 'ok' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] },
+    ])
+    const adapter = adapterFor(baseURL)
+    await collect(adapter, { ...BASE_OPTIONS, sessionId: 'session-1' as never })
+    expect(receivedHeaders()['x-deepseek-harness-session-id']).toBe('session-1')
+    expect(receivedHeaders()['x-deepseek-harness-compact']).toBeUndefined()
+    expect(receivedHeaders()['x-agent-hint']).toBeUndefined()
+  })
+
+  it('marks a compaction request without adding a hint', async () => {
+    const { baseURL, receivedHeaders } = await serve([
+      { choices: [{ delta: { content: 'summary' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] },
+    ])
+    await collect(adapterFor(baseURL), { ...BASE_OPTIONS, purpose: 'compaction' as never })
+    expect(receivedHeaders()['x-deepseek-harness-compact']).toBe('1')
+    expect(receivedHeaders()['x-agent-hint']).toBeUndefined()
+  })
+
   it('declares reasoning efforts and maps the selected one onto the wire', async () => {
     const { baseURL, received } = await serve([
       { choices: [{ delta: { content: 'ok' } }] },

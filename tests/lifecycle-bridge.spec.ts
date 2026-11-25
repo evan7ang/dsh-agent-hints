@@ -4,7 +4,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { CompactionId } from '@deepseek-ai/dsh-compaction'
 import { LifecycleBridge } from '../src/lifecycle-bridge.ts'
 import type { SessionControlClient } from '../src/control-client.ts'
-import type { SessionControlVerb } from '../src/types.ts'
+import type { ManageState } from '../src/hint.ts'
 
 const SID = SessionId('session-1')
 const OTHER = SessionId('session-2')
@@ -47,7 +47,7 @@ function compactionEnd(error?: string): SessionEvent<'compaction/end'> {
 }
 
 interface RecordedCall {
-  verb: SessionControlVerb
+  verb: ManageState
   sessionId: string
   model: string | undefined
 }
@@ -55,7 +55,7 @@ interface RecordedCall {
 function makeBridge(): { bridge: LifecycleBridge; calls: RecordedCall[] } {
   const calls: RecordedCall[] = []
   const client = {
-    send: (verb: SessionControlVerb, sessionId: string, model?: string) => {
+    send: (verb: ManageState, sessionId: string, model?: string) => {
       calls.push({ verb, sessionId, model })
       return Promise.resolve({ status: 'accepted', httpStatus: 200 })
     },
@@ -201,7 +201,7 @@ describe('LifecycleBridge', () => {
     let release: (() => void) | undefined
     const gate = new Promise<void>((resolve) => { release = resolve })
     const client = {
-      send: (_verb: SessionControlVerb, _sessionId: string, _model?: string) => gate,
+      send: (_verb: ManageState, _sessionId: string, _model?: string) => gate,
     } as SessionControlClient
     const bridge = new LifecycleBridge({ client, pendingOpAwaitMs: 1_000 })
     bridge.onSessionCreated(sessionOf({ seeded: true }))
@@ -219,7 +219,7 @@ describe('LifecycleBridge', () => {
   it('fails open when the barrier cap expires first', async () => {
     const gate = new Promise<void>(() => {})
     const client = {
-      send: (_verb: SessionControlVerb, _sessionId: string, _model?: string) => gate,
+      send: (_verb: ManageState, _sessionId: string, _model?: string) => gate,
     } as SessionControlClient
     const bridge = new LifecycleBridge({ client, pendingOpAwaitMs: 10 })
     bridge.onSessionCreated(sessionOf({ seeded: true }))

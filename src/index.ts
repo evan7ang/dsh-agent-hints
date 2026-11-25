@@ -113,10 +113,29 @@ export function apply(ctx: Context, config: Config): void {
     if (sessionId.length === 0) return undefined
     return ctx.get('sessions')?.get(SessionId(sessionId))
   }
+  // Last derived facts per session. A manage request must still be labelled
+  // correctly when its session has already left the store — notably `stop` at
+  // disposal, which can no longer read the session log.
+  const lastManageFacts = new Map<string, ManageSessionFacts>()
+  const rememberManageFacts = (sessionId: string, facts: ManageSessionFacts): void => {
+    lastManageFacts.delete(sessionId)
+    lastManageFacts.set(sessionId, facts)
+    while (lastManageFacts.size > 1024) {
+      const oldest = lastManageFacts.keys().next().value
+      if (oldest === undefined) break
+      lastManageFacts.delete(oldest)
+    }
+  }
   const servingFacts = (sessionId: string): ServingFacts => {
     const session = sessionOf(sessionId)
-    if (session !== undefined) return deriveServingFacts(session)
-    return { callIndex: 1, epoch: 0, turnOpening: true, intervalMs: undefined, afterCompaction: false }
+    if (session === undefined) {
+      return { callIndex: 1, epoch: 0, turnOpening: true, intervalMs: undefined, afterCompaction: false }
+    }
+    const facts = deriveServingFacts(session)
+    rememberManageFacts(sessionId, {
+      callIndex: Math.max(1, facts.callIndex), epoch: facts.epoch, parentSessionId: parentOf(sessionId),
+    })
+    return facts
   }
   // Ordinary history forks may name their source; a subagent names its creator instead.
   const parentOf = (sessionId: string): string | undefined => {
@@ -125,6 +144,9 @@ export function apply(ctx: Context, config: Config): void {
     return header.parentSession === undefined ? undefined : String(header.parentSession)
   }
   const manageFacts = (sessionId: string): ManageSessionFacts => {
+    if (sessionOf(sessionId) === undefined) {
+      return lastManageFacts.get(sessionId) ?? { callIndex: 1, epoch: 0 }
+    }
     const facts = servingFacts(sessionId)
     return { callIndex: Math.max(1, facts.callIndex), epoch: facts.epoch, parentSessionId: parentOf(sessionId) }
   }
