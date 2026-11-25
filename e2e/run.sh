@@ -1,95 +1,95 @@
 #!/usr/bin/env bash
-# Keyless agent-hints wire verification for the standalone plugin: the hint
-# rides the `X-Agent-Hint` HTTP header (model-invisible), so the durable
-# session log cannot show it. This script installs the local plugin package
-# into a scratch profile, mounts the hinted adapter (provider route
-# `deepseek-hint`) against a local SSE capture stub, and drives two headless
-# runs through the real harness:
+# Keyless wire verification for the normalized Agent Hint contract.
 #
-#   run 1: e2e_probe tool round trip → background `subagent` delegation (the
-#          ack settles the call; the child does its own probe round trip and
-#          its completion notice opens a second turn) → parent final answer
-#   run 2: `--session-id` adopts the same session, opening a third turn
+# Installs the local plugin into a scratch profile, points the route at a local
+# capture stub, drives two headless runs (a fresh session, then the same session
+# adopted), and asserts what left the process:
 #
-# The capture assertions then verify every AgentHint field end to end:
-# session identity/lineage/call_index/epoch, the four-value status
-# (running/resume + the out-of-band pause/running/finalize events), the
-# two-level dynamic priority, and the dynamic cache declaration (TTL from the
-# observed interval, wire-sized range, and the post-restart suppression).
+#   run 1: ordinary request carries `start` in the X-Agent-Hint header
+#   run 2: the adopted session emits `resume` (manage request) then `append`
+#   exit:  session disposal emits `stop` (manage request)
+#
+# The body must never carry a hint; auxiliary (title) requests stay hint-free.
 # No API key, no harness-source modification.
 #
-# DSH runtime resolution: DSH_BIN (exact command) > `dsh` on PATH > a
-# deepseek-harness source checkout (DSH_CHECKOUT or the sibling directory).
+# DSH runtime resolution: DSH_BIN (exact command) > the cached 0.2.2-rc.1
+# installation used by this repository's checks. Install it with:
+#   npm install --prefix ~/.cache/dsh-agent-hints-e2e/dsh-0.2.2-rc.1 @deepseek-ai/dsh@0.2.2-rc.1
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRATCH="$(mktemp -d /tmp/dsh-agent-hints-e2e-XXXXXX)"
+CACHED_DSH="$HOME/.cache/dsh-agent-hints-e2e/dsh-0.2.2-rc.1/node_modules/@deepseek-ai/dsh/lib/bin.js"
 cleanup() {
-  for pid in "${STUB_PID:-}" "${STUB2_PID:-}"; do
-    if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then kill "$pid" 2> /dev/null || true; fi
-  done
+  if [ -n "${STUB_PID:-}" ] && kill -0 "$STUB_PID" 2> /dev/null; then kill "$STUB_PID" 2> /dev/null || true; fi
   rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
 
 resolve_dsh() {
   if [ -n "${DSH_BIN:-}" ]; then printf '%s' "$DSH_BIN"; return 0; fi
-  if command -v dsh > /dev/null 2>&1; then command -v dsh; return 0; fi
-  local candidates=("${DSH_CHECKOUT:-}" "$(dirname "$ROOT")/deepseek-harness")
-  local cand
-  for cand in "${candidates[@]}"; do
-    if [ -n "$cand" ] && [ -x "$cand/apps/cli/lib/bin.js" ]; then printf 'node %s' "$cand/apps/cli/lib/bin.js"; return 0; fi
-  done
-  echo "e2e/run.sh: no dsh runtime found (set DSH_BIN or DSH_CHECKOUT, or install dsh on PATH)" >&2
+  if [ -f "$CACHED_DSH" ]; then printf 'node %s' "$CACHED_DSH"; return 0; fi
+  echo "e2e/run.sh: no DSH 0.2.2-rc.1 runtime found (set DSH_BIN, or install $CACHED_DSH)" >&2
   return 1
 }
 
 DSH="$(resolve_dsh)"
+VERSION="$($DSH --version 2> /dev/null | tail -1)"
+if [ "$VERSION" != "0.2.2-rc.1" ]; then
+  echo "e2e/run.sh: expected DSH 0.2.2-rc.1, got '${VERSION}' ($DSH)" >&2
+  exit 1
+fi
 PROFILE="agent-hints-e2e"
 export DSH_HOME="$SCRATCH/home"
+export DEEPSEEK_API_KEY="sk-unused-fixture"
+export HINT_E2E_KEY="sk-agent-hints-e2e-dummy"
 cd "$SCRATCH"
 
-echo "== agent-hints e2e scratch: $SCRATCH (DSH command: $DSH)"
+echo "== agent-hints e2e scratch: $SCRATCH (DSH: $DSH)"
 
-echo "== [1/7] start capture stub"
-node "$ROOT/e2e/stub-server.mjs" --capture "$SCRATCH/capture.jsonl" --port-file "$SCRATCH/stub.port" --status-out "$SCRATCH/status-http.jsonl" &
+echo "== [1/6] start capture stub"
+node "$ROOT/e2e/mock-upstream.cjs" "$SCRATCH/capture.jsonl" "$SCRATCH/stub.port" > "$SCRATCH/stub.log" 2>&1 &
 STUB_PID=$!
-for _ in $(seq 1 50); do
-  [ -f "$SCRATCH/stub.port" ] && break
-  sleep 0.1
-done
-[ -f "$SCRATCH/stub.port" ] || { echo "stub did not start" >&2; exit 1; }
-STUB_PORT="$(cat "$SCRATCH/stub.port")"
-STUB_URL="http://127.0.0.1:$STUB_PORT"
+for _ in $(seq 1 50); do [ -f "$SCRATCH/stub.port" ] && break; sleep 0.1; done
+[ -f "$SCRATCH/stub.port" ] || { echo "stub did not start" >&2; cat "$SCRATCH/stub.log" >&2; exit 1; }
+STUB_URL="http://127.0.0.1:$(cat "$SCRATCH/stub.port")"
 echo "  stub on $STUB_URL"
 
-echo "== [2/7] create profile + install the local plugin package"
+echo "== [2/6] create profile and install the local plugin"
 $DSH --profile "$PROFILE" --from-default-profile headless < /dev/null > /dev/null 2>&1 || true
-$DSH plugin --profile "$PROFILE" add "$ROOT" > /dev/null
-$DSH --profile "$PROFILE" --dump-config 2> /dev/null | grep -q "^- id: agent-hints"
-$DSH --profile "$PROFILE" --dump-config 2> /dev/null | grep -q "name: dsh-agent-hints"
+$DSH plugin --profile "$PROFILE" add "$ROOT" > "$SCRATCH/install.log" 2>&1
+$DSH --profile "$PROFILE" --dump-config 2> /dev/null | grep -q "id: agent-hints" \
+  || { echo "agent-hints row is not mounted" >&2; tail -20 "$SCRATCH/install.log" >&2; exit 1; }
 echo "  agent-hints row mounted"
 
-echo "== [3/7] wire overlay (model binding rides the overlay — settings.yaml is import-once)"
-sed -e "s|__STUB_BASE_URL__|$STUB_URL|" \
-    -e "s|__STATUS_SINK__|$SCRATCH/status.jsonl|" \
-    -e "s|__FIXTURE_TOOL__|$ROOT/e2e/fixture-tool.mjs|" \
-    "$ROOT/e2e/e2e.patch.yml" > "$SCRATCH/patch.yml"
+echo "== [3/6] wire overlay (model binding rides the overlay; settings.yaml is import-once)"
+cat > "$SCRATCH/patch.yml" <<YAML
+- id: agent-hints
+  config:
+    baseURL: $STUB_URL
+    apiKeyEnv: HINT_E2E_KEY
+    models:
+      - id: fixture
+        name: Fixture
+        contextWindow: 8192
+        maxTokens: 256
+- id: agent-default-model
+  config:
+    provider: deepseek-hint
+    model: fixture
+YAML
 
-echo "== [4/7] headless run 1: probe round trip + background subagent delegation"
+echo "== [4/6] headless run 1: fresh session"
 set +e
-AGENT_HINTS_E2E_API_KEY=sk-agent-hints-e2e-dummy \
-  $DSH --profile "$PROFILE" --patch "$SCRATCH/patch.yml" --json \
-  "Call e2e_probe with message START, then delegate a probe to a subagent, then report the outcome." \
+$DSH --profile "$PROFILE" --patch "$SCRATCH/patch.yml" --json "Reply with the single word pong." \
   > "$SCRATCH/run1.jsonl" 2> "$SCRATCH/run1.stderr"
 RUN1_EXIT=$?
 set -e
 if [ "$RUN1_EXIT" -ne 0 ]; then
   echo "run 1 exited $RUN1_EXIT; stderr:" >&2
-  tail -10 "$SCRATCH/run1.stderr" >&2
+  tail -20 "$SCRATCH/run1.stderr" >&2
   exit 1
 fi
-grep -q 'AGENT_HINTS_E2E_FINAL' "$SCRATCH/run1.jsonl"
 SESSION_ID="$(node -e '
 const fs = require("node:fs")
 for (const line of fs.readFileSync(process.argv[1], "utf8").split("\n")) {
@@ -102,72 +102,39 @@ for (const line of fs.readFileSync(process.argv[1], "utf8").split("\n")) {
 [ -n "$SESSION_ID" ] || { echo "run 1 emitted no session id" >&2; exit 1; }
 echo "  run 1 completed (exit 0, session $SESSION_ID)"
 
-echo "== [5/7] headless run 2: adopt the session and open a third turn"
+echo "== [5/6] headless run 2: adopt the session"
 set +e
-AGENT_HINTS_E2E_API_KEY=sk-agent-hints-e2e-dummy \
-  $DSH --profile "$PROFILE" --patch "$SCRATCH/patch.yml" --json --session-id "$SESSION_ID" \
+$DSH --profile "$PROFILE" --patch "$SCRATCH/patch.yml" --json --session-id "$SESSION_ID" \
   "Reply with a one-line acknowledgment." \
   > "$SCRATCH/run2.jsonl" 2> "$SCRATCH/run2.stderr"
 RUN2_EXIT=$?
 set -e
 if [ "$RUN2_EXIT" -ne 0 ]; then
   echo "run 2 exited $RUN2_EXIT; stderr:" >&2
-  tail -10 "$SCRATCH/run2.stderr" >&2
+  tail -20 "$SCRATCH/run2.stderr" >&2
   exit 1
 fi
-grep -q 'AGENT_HINTS_E2E_FINAL' "$SCRATCH/run2.jsonl"
-echo "  run 2 completed (exit 0, adopted session, second turn)"
+echo "  run 2 completed (exit 0, adopted session)"
 
-echo "== [6/7] assert the captured wire fields and status events"
-# The HTTP sink delivers asynchronously; wait for the run-2 finalize to land
-# (three session-scoped finalize events: child + root disposals in run 1,
-# root disposal in run 2).
-for _ in $(seq 1 80); do
-  if [ -f "$SCRATCH/status-http.jsonl" ] \
-    && [ "$(grep -c '"finalize"' "$SCRATCH/status-http.jsonl" 2> /dev/null || true)" -ge 3 ]; then
-    break
-  fi
-  sleep 0.1
-done
-node "$ROOT/e2e/capture-check.mjs" "$SCRATCH/capture.jsonl" "$SCRATCH/status-http.jsonl"
-# Both sinks fire from the same emitter in emission order: the JSONL file and
-# the HTTP-received sequence must be identical.
-node -e "
-const fs = require('node:fs')
-const read = p => fs.readFileSync(p, 'utf8').trim().split('\n').filter(l => l.length > 0).map(JSON.parse)
-const file = read(process.argv[1])
-const http = read(process.argv[2])
-assert = require('node:assert/strict')
-assert.deepEqual(http, file, 'HTTP status events must match the file sink sequence')
-console.log('  file sink and HTTP endpoint sequences identical (' + http.length + ' events)')
-" "$SCRATCH/status.jsonl" "$SCRATCH/status-http.jsonl"
-
-echo "== [7/7] compaction phase: overflow recovery, epoch bump, cache suppression"
-node "$ROOT/e2e/stub-server.mjs" --capture "$SCRATCH/capture-compaction.jsonl" --port-file "$SCRATCH/stub2.port" &
-STUB2_PID=$!
+echo "== [6/6] assert the captured wire contract"
+# The disposal `stop` is issued during exit; give the local fetch a moment to land.
 for _ in $(seq 1 50); do
-  [ -f "$SCRATCH/stub2.port" ] && break
+  if node -e '
+const fs = require("node:fs")
+const rows = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean)
+for (const row of rows) {
+  let value
+  try { value = JSON.parse(row) } catch { continue }
+  const raw = value.headers?.["x-agent-hint"]
+  if (typeof raw !== "string") continue
+  let hint
+  try { hint = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) } catch { continue }
+  if (hint.session?.state === "stop") process.exit(0)
+}
+process.exit(1)
+' "$SCRATCH/capture.jsonl" 2> /dev/null; then break; fi
   sleep 0.1
 done
-[ -f "$SCRATCH/stub2.port" ] || { echo "compaction stub did not start" >&2; exit 1; }
-STUB2_URL="http://127.0.0.1:$(cat "$SCRATCH/stub2.port")"
-sed -e "s|__STUB_BASE_URL__|$STUB2_URL|" \
-    -e "s|__STATUS_SINK__|$SCRATCH/status-compaction.jsonl|" \
-    -e "s|__FIXTURE_TOOL__|$ROOT/e2e/fixture-tool.mjs|" \
-    "$ROOT/e2e/e2e-compaction.patch.yml" > "$SCRATCH/patch-compaction.yml"
-set +e
-AGENT_HINTS_E2E_API_KEY=sk-agent-hints-e2e-dummy \
-  $DSH --profile "$PROFILE" --patch "$SCRATCH/patch-compaction.yml" --json \
-  "HINT_E2E_OVERFLOW call e2e_probe with a huge payload, then report." \
-  > "$SCRATCH/run3.jsonl" 2> "$SCRATCH/run3.stderr"
-RUN3_EXIT=$?
-set -e
-if [ "$RUN3_EXIT" -ne 0 ]; then
-  echo "compaction run exited $RUN3_EXIT; stderr:" >&2
-  tail -10 "$SCRATCH/run3.stderr" >&2
-  exit 1
-fi
-grep -q 'AGENT_HINTS_E2E_FINAL' "$SCRATCH/run3.jsonl"
-node "$ROOT/e2e/compaction-check.mjs" "$SCRATCH/capture-compaction.jsonl" "$SCRATCH/status-compaction.jsonl"
+node "$ROOT/e2e/verify-headless.cjs" "$SCRATCH/capture.jsonl" "$SESSION_ID" "$SCRATCH/run1.jsonl" "$SCRATCH/run2.jsonl"
 
 echo "agent-hints e2e PASS"

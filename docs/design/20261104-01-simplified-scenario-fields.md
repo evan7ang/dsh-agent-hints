@@ -3,6 +3,8 @@
 > 状态：2026-11-04。本文记录 `priority`、`agent_status`、`cache_control` 三类字段在 DSH 侧的取值与发送设计。规范依据为 `docs/handoffs/` 下的三份文档（下称“handoffs”），与 `agent-hint/Agent Hint字段&实现定义.md`（下称“字段定义文档”）冲突处一律以 handoffs 为准。`prediction` 族字段不在本期范围，现有发射机制保持不变。
 >
 > 本文补充并取代 [design.zh.md](../design.zh.md)（v1）中 `agent_status` 五值、`priority` 静态配置、`cache_control` pin 默认值的描述。
+>
+> 字段取值与端到端验证的汇总说明见 [20261105-01-field-reference-and-e2e](20261105-01-field-reference-and-e2e.md)。
 
 ## 1. 目标与边界
 

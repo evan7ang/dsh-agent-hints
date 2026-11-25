@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["es2024", "dom", "dom.iterable"],
+    "tsBuildInfoFile": "lib/client.tsbuildinfo", "types": []
+  },
+  "include": ["src/client/**/*.ts", "src/trace-record.ts"]
+}

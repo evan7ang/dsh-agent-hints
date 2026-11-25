@@ -1,176 +1,150 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 /**
- * AgentHint construction: the schema is the protocol contract, the values are
- * derived from DSH runtime
- * facts (sessionId, session header lineage, session event tracking). Pure and
- * side-effect free so the wire shape is unit-testable without a harness.
+ * AgentHint construction for the normalized protocol: four blocks
+ * (`session` / `context_management` / `priority_control` / `cache_control`)
+ * encoded as UTF-8 JSON into the `X-Agent-Hint` header (base64url, no padding).
  *
- * @module dsh-agent-hints/hint
+ * The request body never carries hint fields. Ordinary requests carry the
+ * session identity, the two-level priority and the dynamic cache declaration;
+ * session lifecycle verbs (`pause` / `resume` / `stop` / `compact`) travel on
+ * dedicated manage requests together with an explicit session-targeted edit.
+ *
+ * Pure and side-effect free so the wire shape is unit-testable without a
+ * harness. The schema is the protocol contract; the values are derived from
+ * DSH runtime facts (session log, session header, config).
+ *
+ * @module @deepseek-ai/dsh-agent-hints/hint
  */
 
-/** `session` block: who is calling, from which lineage, at which call. */
+/** Session lifecycle state carried on the wire. */
+export type SessionState = 'start' | 'append' | 'pause' | 'resume' | 'stop' | 'compact'
+
+/** Lifecycle verbs that own a manage request (never `start` / `append`). */
+export type ManageState = 'pause' | 'resume' | 'stop' | 'compact'
+
+/** Context edit action, derived from the lifecycle verb. */
+export type ContextEditType = 'offload' | 'prefetch' | 'evict'
+
+/** Session block: who is calling, from which lineage, at which call, in which state. */
 export interface AgentHintSession {
   /** Session id; stable within one context. */
   session_id: string
   /** Parent session id; root sessions omit the field. */
   parent_session_id?: string
-  /** How this context came to exist; only present with a parent. */
-  derivation?: {
-    relation: 'fork' | 'spawn' | 'handoff'
-    /** Whether the parent waits for this context (protocol default `sync`). */
-    join?: 'sync' | 'async'
-    fork_point?: number
-  }
-  /** Agent type identifier. */
-  agent_type: string
   /** Call index inside the session, starting at 1. */
   call_index: number
   /** Context version; bumped after a context rewrite (compaction). */
   epoch: number
+  /** Lifecycle state of this request. */
+  state: SessionState
 }
 
-/**
- * `agent_status` block as carried on the request header: the four-value
- * lifecycle contract, and ONLY `state` + `state_since_ms` (diagnostic fields
- * stay on the out-of-band event channel). DSH never sends `finalize` on the
- * header — a completed run has no closing request — so it rides the
- * session-scoped `session/disposed` status event instead.
- */
-export interface AgentHintAgentStatus {
-  state: 'running' | 'pause' | 'resume' | 'finalize'
-  /** Unix epoch milliseconds when the current state was entered. */
-  state_since_ms: number
+/** One context edit. Only whole-session edits are emitted by a harness. */
+export interface AgentHintEdit {
+  type: ContextEditType
+  target: 'session'
 }
 
-/** `priority` / `strict_priority` block. `strict_priority` is never sent by an agent: it is reserved for a trusted control plane. */
+/** Context management block: manage-request marker plus its edits. */
+export interface AgentHintContextManagement {
+  /** True: the request body is not executed, only the edits are processed. */
+  manage_request: boolean
+  edits: AgentHintEdit[]
+}
+
+/** `priority_control.priority` block. */
 export interface AgentHintPriority {
   level: number
   reason: string
 }
 
-/** One `cache_control` entry: pin or ephemeral intent over a message/token range. */
+/** `cache_control` block: one ephemeral declaration for the current prefix. */
 export interface AgentHintCacheControl {
-  type: 'pin' | 'ephemeral'
-  /** Retention seconds; applies to pin or ephemeral. */
-  ttl_s?: number
-  range?: {
-    start?: number
-    end?: number | null
-    unit?: 'message' | 'token'
-  }
-}
-
-/**
- * `prediction` block: pre-event estimates for the serving engine (field
- * definition §2.6); actual state is whatever the following `agent_status`
- * reports. The prediction family is unchanged by the four-value convergence —
- * its `next_action.state` keeps the full protocol vocabulary.
- */
-export interface AgentHintPrediction {
-  latency_ms?: number
-  remaining_calls?: number
-  output_tokens?: number
-  interval_ms?: number
-  remaining_time_ms?: number
-  expected_resume_s?: number
-  next_action?: {
-    state: 'running' | 'tool' | 'pause' | 'suspend' | 'finalize'
-    tools?: Array<{ name: string; expected_duration_s?: number }>
-    prob?: number
-  }
+  type: 'ephemeral'
+  /** Retention seconds for the current prefix. */
+  ttl_s: number
+  /** 1-based effective message offset; equals the request's wire message count. */
+  msg_offset: number
 }
 
 /** The complete AgentHint object encoded into the `X-Agent-Hint` header value. */
 export interface AgentHint {
   session: AgentHintSession
-  agent_status?: AgentHintAgentStatus
-  priority?: AgentHintPriority
-  strict_priority?: AgentHintPriority
-  cache_control?: AgentHintCacheControl | AgentHintCacheControl[]
-  prediction?: AgentHintPrediction
+  context_management?: AgentHintContextManagement
+  priority_control?: { priority: AgentHintPriority }
+  cache_control?: AgentHintCacheControl
 }
 
-/** Runtime facts for one request, gathered by the plugin from DSH services. */
-export interface HintRequestFacts {
-  /** Session identity stamped by the agent loop. */
+/** Verb → edit map shared by both adapters and the control client. */
+export const STATE_EDIT: Readonly<Record<ManageState, ContextEditType>> = Object.freeze({
+  pause: 'offload',
+  resume: 'prefetch',
+  stop: 'evict',
+  compact: 'evict',
+})
+
+/** Encode one AgentHint as the `X-Agent-Hint` header value (base64url, no padding). */
+export function encodeAgentHintHeader(hint: AgentHint): string {
+  return Buffer.from(JSON.stringify(hint), 'utf8').toString('base64url')
+}
+
+/** Facts for one ordinary request's hint. */
+export interface OrdinaryHintFacts {
   sessionId: string
-  /** Per-session call counter, already incremented for this request. */
+  parentSessionId?: string | undefined
   callIndex: number
-  /** Per-session context version. */
   epoch: number
-  /** Request-time lifecycle state (DSH never sends `finalize` on the header). */
-  state: 'running' | 'pause' | 'resume'
-  /** When the current state was entered; `undefined` for `running` with no observed entry (falls back to the request time). */
-  stateSinceMs?: number
-  /** Parent session id from the live session header, when resolvable. */
-  parentSession?: string
-  /** `origin` from the live session header (`'subagent'` under delegation). */
-  parentOrigin?: string
-  /** Parent's wait mode for this context, derived from the delegating tool call's `run_in_background`. */
-  derivationJoin?: 'sync' | 'async'
-  /** Per-request soft priority (dynamic two-level or a static override); `undefined` omits the field. */
-  priority?: AgentHintPriority
-  /** Per-request cache control entries; `undefined` omits the field. */
-  cacheControl?: AgentHintCacheControl[]
-  /** Resolved `prediction` block for this request; `undefined` omits the block. */
-  prediction?: AgentHintPrediction
+  /** `start` on a fresh session's first ordinary request, `append` afterwards. */
+  state: 'start' | 'append'
+  priority?: AgentHintPriority | undefined
+  cacheControl?: AgentHintCacheControl | undefined
 }
 
-/** Static per-composition behavior. */
-export interface HintOptions {
-  /** Agent type identifier reported in `session.agent_type`. */
-  agentType: string
-}
-
-/**
- * Build one AgentHint for a main-line model request. Status and intent come
- * from the per-request facts: the status is the tracked four-value state, the
- * priority is the dynamic two-level value (or a static override), and cache
- * control is the derived single ephemeral declaration.
- * @param facts - runtime facts gathered for this request.
- * @param options - static composition behavior.
- * @param nowMs - wall clock for an unobserved `state_since_ms` fallback.
- */
-export function buildAgentHint(facts: HintRequestFacts, options: HintOptions, nowMs: number): AgentHint {
+/** Build the hint for one ordinary (main-line) request. */
+export function buildOrdinaryHint(facts: OrdinaryHintFacts): AgentHint {
   const session: AgentHintSession = {
     session_id: facts.sessionId,
-    agent_type: options.agentType,
     call_index: facts.callIndex,
     epoch: facts.epoch,
+    state: facts.state,
   }
-  if (facts.parentSession !== undefined) {
-    session.parent_session_id = facts.parentSession
-    session.derivation = {
-      relation: facts.parentOrigin === 'subagent' ? 'spawn' : 'fork',
-      ...facts.derivationJoin !== undefined ? { join: facts.derivationJoin } : {},
-    }
-  }
-  const hint: AgentHint = {
-    session,
-    agent_status: {
-      state: facts.state,
-      state_since_ms: facts.stateSinceMs ?? nowMs,
-    },
-  }
-  if (facts.priority !== undefined) hint.priority = { ...facts.priority }
-  if (facts.cacheControl !== undefined) {
-    hint.cache_control = facts.cacheControl.map(entry => ({
-      ...entry,
-      ...entry.range !== undefined ? { range: { ...entry.range } } : {},
-    }))
-  }
-  if (facts.prediction !== undefined) hint.prediction = { ...facts.prediction }
+  if (facts.parentSessionId !== undefined) session.parent_session_id = facts.parentSessionId
+  const hint: AgentHint = { session }
+  if (facts.priority !== undefined) hint.priority_control = { priority: { ...facts.priority } }
+  if (facts.cacheControl !== undefined) hint.cache_control = { ...facts.cacheControl }
   return hint
 }
 
+/** Facts for one manage request's hint. */
+export interface ManageHintFacts {
+  sessionId: string
+  parentSessionId?: string | undefined
+  callIndex: number
+  /** For `compact`: the epoch of the context being evicted; otherwise the current one. */
+  epoch: number
+  state: ManageState
+}
+
 /**
- * Encode one AgentHint as the `X-Agent-Hint` header value: UTF-8 JSON,
- * base64url (base64 with a URL-safe alphabet; no `=` padding on the wire
- * since Buffer's base64url omits it).
- * @param hint - the assembled hint object.
+ * Build the hint for one manage request: the verb plus the edit it asks for.
+ * The request body is a placeholder (`messages: []`, `stream: false`) and the
+ * consumer must not execute it as inference.
  */
-export function encodeAgentHintHeader(hint: AgentHint): string {
-  return Buffer.from(JSON.stringify(hint), 'utf8').toString('base64url')
+export function buildManageHint(facts: ManageHintFacts): AgentHint {
+  const session: AgentHintSession = {
+    session_id: facts.sessionId,
+    call_index: facts.callIndex,
+    epoch: facts.epoch,
+    state: facts.state,
+  }
+  if (facts.parentSessionId !== undefined) session.parent_session_id = facts.parentSessionId
+  return {
+    session,
+    context_management: {
+      manage_request: true,
+      edits: [{ type: STATE_EDIT[facts.state], target: 'session' }],
+    },
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -181,54 +155,48 @@ export function encodeAgentHintHeader(hint: AgentHint): string {
 export interface DerivationEvent {
   type: string
   time: number
-  data?: {
-    /** `tool/call`: provider-issued call id pairing call with result. */
-    callId?: unknown
-    /**
-     * `tool/result`: the settled result message. Current vocabulary:
-     * first-class tool-role message with a top-level `toolCallId`; legacy
-     * vocabulary: user message carrying a `tool-result` content block.
-     */
-    message?: {
-      toolCallId?: unknown
-      content?: Array<{ type?: unknown; toolCallId?: unknown }>
-    }
-  }
+  /** Event payload; read defensively because the harness vocabulary is merge-extensible. */
+  data?: unknown
 }
 
 /**
- * Pair one `tool/result` event with its call. Two payload vocabularies exist
- * in the wild: harness ≥ 0.2.2 appends a first-class tool-role message whose
- * top-level `toolCallId` settles the call; earlier versions wrapped the
- * result in a `tool-result` content block on a user message.
+ * Read the tool-call id settled by one `tool/result` event. Two payload
+ * vocabularies exist in the wild: harness ≥ 0.2.2 appends a first-class
+ * tool-role message whose top-level `toolCallId` settles the call; earlier
+ * versions wrapped the result in a `tool-result` content block on a user
+ * message.
  */
 export function toolResultCallId(event: DerivationEvent): string | undefined {
-  const message = event.data?.message
-  if (typeof message?.toolCallId === 'string') return message.toolCallId
-  const block = message?.content?.find(candidate => candidate?.type === 'tool-result')
-  return typeof block?.toolCallId === 'string' ? block.toolCallId : undefined
+  if (typeof event.data !== 'object' || event.data === null) return undefined
+  const message = (event.data as { message?: unknown }).message
+  if (typeof message !== 'object' || message === null) return undefined
+  const settled = message as { toolCallId?: unknown; content?: unknown }
+  if (typeof settled.toolCallId === 'string') return settled.toolCallId
+  if (!Array.isArray(settled.content)) return undefined
+  for (const block of settled.content) {
+    if (typeof block !== 'object' || block === null) continue
+    const candidate = block as { type?: unknown; toolCallId?: unknown }
+    if (candidate.type === 'tool-result' && typeof candidate.toolCallId === 'string') return candidate.toolCallId
+  }
+  return undefined
 }
 
 /** The minimal session-log view the derivation reads. */
 export interface DerivationSession {
-  ownEvents(): DerivationEvent[]
+  ownEvents(): readonly DerivationEvent[]
 }
 
-/** Serving facts derived from the durable event log; all survive process restarts (the log replays on restore). */
+/** Serving facts derived from the durable event log; all survive process restarts. */
 export interface ServingFacts {
-  /** Main-line model calls so far, INCLUDING the current one: `step/start` is appended before each dispatch, so the count is the ordinal of the in-flight call. Auxiliary calls (compaction/session-title) run outside loop steps and never append `step/start`. */
+  /** Main-line model calls so far, INCLUDING the current one (`step/start` precedes dispatch). */
   callIndex: number
   /** Context version: completions of compaction rewrites. */
   epoch: number
-  /** Request-time lifecycle state (four-value contract minus `finalize`, which never rides the header in DSH). */
-  state: 'running' | 'pause' | 'resume'
-  /** When the current state was entered; `undefined` for `running` with no observed entry (request time fallback). */
-  stateSinceMs?: number
-  /** True when the in-flight call is the first of its turn — the user-intervention signal for the two-level priority. */
+  /** True when the in-flight call is the first of its turn (the two-level priority signal). */
   turnOpening: boolean
   /** Last response-end → this request-start gap, when observed (the cache TTL source). */
   intervalMs?: number
-  /** A compaction rewrite completed between the previous and the current main-line call (suppresses cache declarations for that round). */
+  /** A compaction rewrite completed after the previous main-line response (suppresses cache declarations). */
   afterCompaction: boolean
 }
 
@@ -236,28 +204,17 @@ export interface ServingFacts {
  * Derive per-request serving facts from the session's own event log — the
  * durable, restart-safe basis (restored sessions replay their log).
  *
- * Lifecycle state (per the handoff contract): an unpaired `tool/call` means
- * the agent is paused awaiting the tool; the first call after the pending set
- * last emptied is `resume`; everything else is `running`. Any `turn/end`
- * closes the resume window (the next turn opens as `running`).
- *
- * Priority signal: `turnOpening` is the first call after the latest
- * `turn/start` (falling back to `callIndex === 1` when the log has no turn
- * boundary events).
- *
- * Cache signals: `intervalMs` is the previous response end (`step/end`) to
- * this request start; `afterCompaction` flags a rewrite between the previous
- * and the current call.
+ * - `call_index` counts `step/start` events, appended before each dispatch.
+ * - `epoch` counts `compaction/end` events (one history rewrite each).
+ * - `turnOpening` is the first call after the latest `turn/start`
+ *   (falling back to `callIndex === 1` when the log has no turn boundaries).
+ * - `intervalMs` is the previous `step/end` to this request's `step/start`.
+ * - `afterCompaction` flags a rewrite after the previous response end.
  * @param session - the live session handle (structural `Session`).
  */
 export function deriveServingFacts(session: DerivationSession): ServingFacts {
   let callIndex = 0
   let epoch = 0
-  const pending = new Map<string, number>()
-  let pauseSinceMs: number | undefined
-  let releaseAt: number | undefined
-  let stepsAfterRelease = 0
-  let turnEndAfterRelease = false
   let latestTurnStartAt: number | undefined
   let turnStartSeen = false
   let stepsSinceTurnStart = 0
@@ -276,7 +233,6 @@ export function deriveServingFacts(session: DerivationSession): ServingFacts {
       case 'step/start':
         callIndex += 1
         stepsSinceTurnStart += 1
-        stepsAfterRelease += 1
         lastStepStartAt = event.time
         stepEndBeforeLastStepStart = lastStepEndAt
         break
@@ -287,45 +243,7 @@ export function deriveServingFacts(session: DerivationSession): ServingFacts {
         epoch += 1
         lastCompactionAt = event.time
         break
-      case 'tool/call': {
-        const callId = typeof event.data?.callId === 'string' ? event.data.callId : undefined
-        if (callId !== undefined) {
-          if (pending.size === 0) pauseSinceMs = event.time
-          pending.set(callId, event.time)
-        }
-        break
-      }
-      case 'tool/result': {
-        const callId = toolResultCallId(event)
-        if (callId !== undefined && pending.delete(callId) && pending.size === 0) {
-          pauseSinceMs = undefined
-          releaseAt = event.time
-          stepsAfterRelease = 0
-          turnEndAfterRelease = false
-        }
-        break
-      }
-      case 'turn/end':
-        pending.clear()
-        pauseSinceMs = undefined
-        turnEndAfterRelease = true
-        break
     }
-  }
-
-  let state: ServingFacts['state']
-  let stateSinceMs: number | undefined
-  if (pending.size > 0) {
-    state = 'pause'
-    stateSinceMs = pauseSinceMs
-  } else if (releaseAt !== undefined && !turnEndAfterRelease && stepsAfterRelease === 1) {
-    state = 'resume'
-    stateSinceMs = releaseAt
-  } else {
-    state = 'running'
-    stateSinceMs = latestTurnStartAt !== undefined && releaseAt !== undefined
-      ? Math.max(latestTurnStartAt, releaseAt)
-      : latestTurnStartAt ?? releaseAt
   }
 
   const turnOpening = turnStartSeen ? stepsSinceTurnStart === 1 : callIndex === 1
@@ -333,10 +251,8 @@ export function deriveServingFacts(session: DerivationSession): ServingFacts {
     && lastStepStartAt > stepEndBeforeLastStepStart
     ? lastStepStartAt - stepEndBeforeLastStepStart
     : undefined
-  // A compaction rewrite after the previous response end (between steps, or
-  // mid-step for an overflow-recovery retry) changed the prefix this round.
   const afterCompaction = lastCompactionAt !== undefined
     && lastCompactionAt > (stepEndBeforeLastStepStart ?? Number.NEGATIVE_INFINITY)
 
-  return { callIndex, epoch, state, stateSinceMs, turnOpening, intervalMs, afterCompaction }
+  return { callIndex, epoch, turnOpening, intervalMs, afterCompaction }
 }

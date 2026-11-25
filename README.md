@@ -1,142 +1,138 @@
 # dsh-agent-hints
 
-Per-request serving-intent hints for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): every main-line model request carries a structured **AgentHint on the `X-Agent-Hint` HTTP header** (UTF-8 JSON, base64url) — session identity, agent status, priority, and cache control — so a serving engine (your inference gateway) can observe and act on what the agent is doing, per the "agent signals, engine consumes" pattern.
+Per-request Agent Hint for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): a provider route whose model requests carry one structured **`X-Agent-Hint`** header (UTF-8 JSON, base64url) — session identity, lifecycle state, two-level priority and a cache declaration — and whose session lifecycle drives bounded manage requests. The request body never carries hint fields.
 
-The plugin registers an **independent provider route `deepseek-hint`** backed by its own chat-completions adapter. The official `deepseek-official` route stays mounted and remains the fallback; deployment switches via `agent-default-model.provider`. Zero harness source modification, zero harness runtime dependencies (cordis is touched as a structural duck type only).
+The plugin registers an independent provider route (**default `deepseek-hint`**) over Chat Completions or the official Messages pipeline, inherits endpoint, model catalog and credential reference from the sibling `llm-deepseek` route, and installs the stock-host composer observer that lets a browser draft trigger an early `resume`.
 
-English | [中文](README.zh.md) · Design notes: [docs/design.md](docs/design.md) ([中文](docs/design.zh.md))
+English | [中文](README.zh.md) · Contracts: [transport](docs/transport.md) · [reliability](docs/reliability.md) · [endpoint inheritance](docs/endpoint-inheritance.md) · [trace](docs/trace.md)
 
-## How it works
+## Wire contract
 
-The harness `LlmAdapter` contract is thin (only `stream()` is required), and the official adapter constructs its HTTP headers inside its `request()` implementation with no extension point. This plugin therefore ships a self-contained adapter that implements the contract structurally and adds one header:
-
-```http
-POST {baseURL}/chat/completions
-authorization: Bearer …
-content-type: application/json
-x-deepseek-harness-session-id: session-…          ← identity signal, aligned with the official adapter
-x-agent-hint: eyJzZXNzaW9uIjp7InNlc3Npb25faWQi…   ← base64url of a UTF-8 JSON AgentHint
-```
-
-The request body stays in the provider's original chat-completions format and **never carries hint fields**. To an endpoint that does not understand the header, it is a harmless unknown header.
-
-This differs from static header-injection approaches (e.g. wrapping `fetch` to set fixed headers like a `user-agent`): here the hint value is **derived per request** from the session's durable event log (call index, compaction epoch, last tool result time) and the session lineage — there is nothing static to configure.
-
-### Header emission rules
-
-- **Main-line requests only**: auxiliary calls (`compaction`, `session-title` purposes) and requests without a session identity carry no hint.
-- `strict_priority` is **never sent** by an agent (trusted-control-plane field).
-- `agent_status` follows the four-value contract. `running` by default; `pause` while a tool call is unanswered (every tool call counts as waiting on something external, per this deployment's adjudication); `resume` on the first request after the release, one-shot. `finalize` never rides the header — a completed run has no closing request — it is session-scoped (session over, release session-level resources) and rides the `session/disposed` status event, exactly once per session lifetime as its last event.
-- `priority` is the dynamic two-level value by default: turn-opening requests are user intervention (`3` / `user_waiting`), everything else is self-driven continuation (`1` / `critical_path`). A static `{level, reason}` is a constant override folded into `{1, 3}`; `null` omits the field.
-- `cache_control` is one dynamic `ephemeral` entry by default: `range.end` is the wire message count and `ttl_s = clamp(last interval × 2, 60, 3600)`. Declarations are suppressed for a compaction round, a model/tool-set change, or a prefix below 128 estimated tokens. A static array overrides the policy (ephemeral only, explicit `ttl_s`); an entry without an explicit `range` declares the request's wire message count (`range.end` + `unit: message`) at send time. `null` omits it.
-- `prediction` rides the same header when a source is configured (`predictionTrie` and/or `predictionStatic`); with no source configured the block is omitted and the wire shape is unchanged. Values come from an offline trie (longest tool-sequence-prefix match) with per-field static fallback.
-- Session identity mirrors the official adapter: `x-deepseek-harness-session-id` (when a session id exists) and `x-deepseek-harness-compact: 1` (on compaction) are sent as-is.
-
-### The `X-Agent-Hint` payload
+Four blocks, no more:
 
 ```jsonc
+// Ordinary request: first request of a fresh session
 {
-  "session": {
-    "session_id": "session-…",
-    "agent_type": "agent",
-    "call_index": 7,          // derived from the session's durable log (step/start count); restart-safe
-    "epoch": 0                // derived from compaction/end count; restart-safe
-    // "parent_session_id" / "derivation": {"relation": "spawn"|"fork", "join": "sync"|"async"} — lineage sessions only
-  },
-  "agent_status": { "state": "running", "state_since_ms": 1760000000000 },  // running | pause | resume
-  "priority": { "level": 3, "reason": "user_waiting" },           // dynamic two-level; static override; null omits
-  "cache_control": [{ "type": "ephemeral", "ttl_s": 600, "range": { "end": 3, "unit": "message" } }],  // dynamic; null omits
-  // "prediction": { "latency_ms": 8251, "remaining_calls": 2, "output_tokens": 640,
-  //   "interval_ms": 251, "remaining_time_ms": 42000,
-  //   "next_action": { "state": "tool", "tools": [{"name": "web_search", "expected_duration_s": 9}], "prob": 0.8 } }
-  //   — only when predictionTrie/predictionStatic is configured; trie miss falls back per field
+  "session": { "session_id": "s-1", "parent_session_id": "p-1", "call_index": 1, "epoch": 0, "state": "start" },
+  "priority_control": { "priority": { "level": 3, "reason": "user_waiting" } },
+  "cache_control": { "type": "ephemeral", "ttl_s": 600, "msg_offset": 10 }
+}
+
+// Ordinary request: every later call
+{
+  "session": { "session_id": "s-1", "call_index": 5, "epoch": 1, "state": "append" },
+  "priority_control": { "priority": { "level": 1, "reason": "critical_path" } },
+  "cache_control": { "type": "ephemeral", "ttl_s": 300, "msg_offset": 12 }
+}
+
+// Manage request: body is a placeholder ({ model, messages: [], stream: false })
+{
+  "session": { "session_id": "s-1", "call_index": 5, "epoch": 1, "state": "pause" },
+  "context_management": { "manage_request": true,
+                          "edits": [{ "type": "offload", "target": "session" }] }
 }
 ```
 
-Out-of-band status events (`pause` → `running` → `finalize` per working session, incl. awaited tool names and call ids) are reported to the optional `statusSink` (local JSONL file); the `emit()` seam is where a gateway client takes over.
+- `state` has six values: `start` / `append` / `pause` / `resume` / `stop` / `compact`. `start` appears exactly once per fresh session; every other ordinary request is `append`.
+- Lifecycle verbs own a manage request: `pause` → `offload`, `resume` → `prefetch`, `stop` → `evict`, `compact` → `evict` on `target: "session"`. `compact` carries the epoch being evicted.
+- Auxiliary calls (any declared `purpose`, e.g. compaction summary or session title) carry no hint at all.
+- The body is byte-identical to the provider's own request format; the hint lives only in the header.
+
+### Lifecycle triggers
+
+| state | trigger |
+| --- | --- |
+| `start` | first accepted ordinary request of a fresh (non-seeded) session |
+| `append` | every other ordinary request |
+| `pause` | another session's ordinary request was accepted while this session is idle and its streams finished |
+| `resume` | before the next ordinary request of a seeded/paused session, or on the first non-empty composer edit |
+| `stop` | session disposal, or a successful archive |
+| `compact` | `compaction/end` without an error |
+
+### Priority and cache
+
+- `priority_control` rides every ordinary request: turn-opening calls are `3` / `user_waiting`, self-driven continuations `1` / `critical_path`. A static `{ level, reason }` is a constant override; `"omit"` suppresses it.
+- `cache_control` is one `ephemeral` declaration per qualifying ordinary request: `msg_offset` is the request's wire message count and `ttl_s = clamp(last interval × 2, 60, 3600)`. Declarations are suppressed for a compaction round, a model/tool-set change, and a prefix under 128 estimated tokens. A static `{ ttl_s, msg_offset? }` overrides the policy; `"omit"` suppresses it.
+
+## Transports
+
+- **Chat** (default): the plugin's own Chat Completions adapter writes the header per request and keeps roles, tool-call/result ids and reasoning history. Native images/files are rejected explicitly (`UNSUPPORTED_CONTENT`), never silently dropped.
+- **Messages**: the official `DeepSeekAdapter` pipeline (attachments included). It has no per-request header hook, so the plugin binds the request's hint through AsyncLocalStorage and writes it in `resolveAuth`. Replace this seam if the host grows a first-class header hook.
 
 ## Install
 
-Built JS is committed to this repository (`lib/`), so installing from GitHub needs **no build-script permission**:
+Built JS is committed to this repository (`lib/`), so installing from GitHub needs no build-script permission:
 
-```sh
-dsh plugin add github:evan7ang/dsh-agent-hints
+```bash
+dsh plugin --profile <your-profile> add github:<owner>/dsh-agent-hints#<commit>
 ```
 
-Pin a commit for reproducibility: `dsh plugin add github:evan7ang/dsh-agent-hints#<sha>`. An npm package (`dsh plugin add dsh-agent-hints`) is planned but not yet published.
+Or build locally and install the tarball:
 
-## Configure and deploy
+```bash
+npm ci
+npm run check
+npm pack
+dsh plugin --profile <your-profile> add "$PWD"/dsh-agent-hints-0.4.0.tgz
+```
 
-The plugin is inert until you point it at an upstream. Override the `agent-hints` row in your profile's `cordis.patch.yml` (later layers replace the row's entire `config` value, so restate every key you need):
+Requires Node `^22.19.0 || >=24` and DSH **0.2.2-rc.1**. Restart the instance, then point `agent-default-model.provider` at the route id (`deepseek-hint` by default).
+
+## Configuration
+
+Zero configuration works when the sibling `llm-deepseek` route is configured: endpoint, model catalog and credential reference are inherited. Every field below overrides that inheritance.
 
 ```yaml
 - id: agent-hints
   config:
-    baseURL: https://your-gateway.example.com
-    apiKeyEnv: MY_GATEWAY_KEY
+    provider: deepseek-hint        # provider route id (reload to change)
+    transport: chat                # chat | messages
+    baseURL: http://127.0.0.1:1025 # optional; inherited > DSH_AGENT_HINT_BASE_URL > DEEPSEEK_BASE_URL
+    apiKeyEnv: MOTOR_API_KEY       # optional credential reference; same-endpoint sources may inherit
+    inheritCredentials: true
+    models:
+      - id: served-model
+        name: Served Model
+        contextWindow: 32768
+        maxTokens: 4096
+    agentHint:
+      enabled: true
+      priority: dynamic            # dynamic | omit | { level, reason }
+      cacheControl: dynamic        # dynamic | omit | { ttl_s, msg_offset? }
+      sessionControl:
+        enabled: true
+        pluginTriggers: true       # stock-host composer Remote + public archive observer
+        pendingOpAwaitMs: 2000
+        controlTimeoutMs: 5000
+        retries: 1
+      trace:
+        enabled: true
+        maxRecords: 2000
+        writeToSession: true
 ```
 
-Then switch the model route:
+`agentHint.enabled: false` keeps the route as a plain model route without hints or lifecycle control. Invalid values fail at composition with a field path.
 
-```yaml
-# $DSH_HOME/settings.yaml
-agent-default-model:
-  provider: deepseek-hint
-  model: deepseek-flash
+## Consumer requirement
+
+The header is additive and harmless to a backend that ignores it — but the lifecycle verbs and priority admission only take effect once the consumer parses the normalized header:
+
+1. Decode `X-Agent-Hint` before request validation and accept an empty `messages` array when `context_management.manage_request` is true.
+2. Map `session.state` onto whatever lifecycle vocabulary the consumer uses (`start`/`append` carry no context action).
+3. Map `context_management` onto its engine-visible form, and read priority from `priority_control.priority.{level, reason}`.
+4. `cache_control.{ttl_s, msg_offset}` replaces the legacy `{ttl, msg_offset}` declaration.
+
+Until then, ordinary requests still carry session identity and cache declarations, while manage requests are rejected and logged as failed.
+
+## Verification
+
+```bash
+npm run check                    # typecheck, build, unit/integration tests, package check
+bash e2e/run.sh                  # keyless wire e2e against DSH 0.2.2-rc.1
 ```
 
-The API key resolves per request: credentials service first (`$DSH_HOME/.credentials.yaml` / Models page), then the environment variable named by `apiKeyEnv` — the same order as the official adapter.
-
-### Configuration reference
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `baseURL` | string | inherits `$DEEPSEEK_BASE_URL` → `https://api.deepseek.com` | Upstream base; every chat request posts to `${baseURL}/chat/completions` |
-| `apiKeyEnv` | string | inherits `$DEEPSEEK_API_KEY_ENV` → `DEEPSEEK_API_KEY` | Environment-variable name resolved per request (credentials service first) |
-| `agentType` | string | `agent` | Reported as `session.agent_type` |
-| `priority` | `"dynamic"`, `{level, reason}`, or `null` | `"dynamic"` | Two-level soft priority. Dynamic: `3`/`user_waiting` on turn-opening requests, `1`/`critical_path` otherwise. A static object is folded into `{1, 3}`; `null` omits the field |
-| `cacheControl` | `"dynamic"`, array, or `null` | `"dynamic"` | Dynamic: one `ephemeral` entry with a derived TTL. A static array overrides the policy (`ephemeral` only, explicit `ttl_s`, at most one entry); an entry without `range` declares the request's wire message count. `null` omits the field |
-| `thinking` | `"enabled"` / `"disabled"` | enabled | `disabled` limits every conversation request to `off` |
-| `reasoningEffort` | `"off"/"low"/"high"/"max"` | `high` | Default reasoning effort when a request carries none |
-| `models` | `{id, name, contextWindow, maxTokens}[]` | DeepSeek-V4 family catalog | Advisory model catalog for `resolveModel`; **provide real limits when pointing at your own gateway** (they feed compaction decisions) |
-| `defaultContextWindow` | positive integer | `1000000` | Context window assumed for models absent from the catalog |
-| `defaultMaxTokens` | positive integer | `256000` | Per-request output cap materialized when callers omit one |
-| `statusSink` | string | unset (file sink off) | Local JSONL path for out-of-band status events |
-| `statusEndpoint` | string | unset | Full status-event endpoint URL (Motor scheduler); overrides `statusAuto` |
-| `statusAuto` | boolean | `false` | Derive the status endpoint from `baseURL`'s origin (`<origin>/agent-status`) |
-| `predictionTrie` | string | unset (block off) | Offline prediction trie (built by `scripts/build-prediction-trie.mjs`); enables trie-sourced `prediction` values |
-| `predictionStatic` | object | unset | Static per-field fallbacks (`latency_ms`/`remaining_calls`/`output_tokens`/`interval_ms`/`remaining_time_ms`); configuring this or `predictionTrie` turns the `prediction` block on |
-| `predictionMinSamples` | positive integer | `5` | Minimum node sample count for a trie distribution to be trusted over the static value |
-| `subagentToolNames` | string[] | `["subagent"]` | Tool names treated as subagent delegation for `derivation.join` and status naming |
-
-Invalid config aborts composition at load time with a field path — request-time hint construction has no failure path.
-
-## Known limits (v1)
-
-- Chat-completions wire only; subset: text + tools + thinking + usage + abort. Image/file content is rejected explicitly (`UNSUPPORTED_CONTENT`), never silently degraded.
-- The protocol subset must be kept in sync with the official adapter manually (the deployment target is your own gateway, so the subset is under control).
-- `call_index`/`epoch`/`state_since_ms` are derived from the session's event log and depend on harness event semantics (`step/start` precedes dispatch; auxiliary calls do not count as loop steps).
-- Tool waits are reported as `pause` (this deployment's adjudication): the four-value contract's literal "tool execution counts as running" is folded at the sender, so consumers see `pause` for every awaited tool call.
-- The one-shot `resume` is re-sent when the harness retries a request — the sender cannot know whether a header was delivered.
-- Human-approval priority boosts are not implemented: a tool gate cannot be distinguished from a human gate, so only turn-opening requests carry `level: 3`.
-- `cache_control` TTL uses the last request interval only; the next-tool-duration signal would need `prediction.next_action`, which this deployment does not configure.
-- `derivation.join` reads the parent's most recent delegating tool call — parallel delegations share the latest value (accepted approximation).
-- Switching providers back to `deepseek-official` silently drops hints; the e2e wire assertions below are the safety net.
-- **Always-thinking models**: the session-title auxiliary call forces `thinking: {type: "disabled"}` (official convention). Gateways backed by always-thinking models (e.g. `glm-5.3-flash` on Volcengine) reject it with an error; the harness tolerates the failure — the task itself is unaffected — but such sessions get no generated title. Prefer a model that supports thinking-off for auxiliary calls, or accept untitled sessions (verified on a real gateway: main-line requests with `thinking: enabled` + `reasoning_effort` are accepted, the task completes exit 0, and the hint header reaches the gateway).
-
-## Development
-
-```sh
-npm install
-npm run build        # src/ → lib/ (built JS is committed)
-npm test             # node --test against the built JS
-e2e/run.sh           # keyless wire e2e through a real harness: probe round trip,
-                     # foreground subagent delegation, session adoption, and an
-                     # overflow-compaction round — asserts every hint field
-```
-
-The e2e resolves the `dsh` runtime from `DSH_BIN`, `PATH`, or a deepseek-harness checkout (`DSH_CHECKOUT` or the sibling directory).
+The e2e installs the local package into a scratch profile, drives two headless runs (fresh session, then the same session adopted) against a capture stub, and asserts the header shape, `start`/`append`, the `resume` manage request, the dispatched `stop`, the placeholder body and the hint-free title request. Browser typing is covered by component tests; a real browser acceptance run is still pending.
 
 ## License
 
-[MulanPSL-2.0](LICENSE)
+MulanPSL-2.0. Portions are derived from the MIT-licensed `dsh-agenthint` plugin and the DeepSeek Harness AgentHint integration branch; see [NOTICE](NOTICE).

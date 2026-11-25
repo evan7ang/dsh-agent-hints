@@ -1,305 +1,231 @@
 // SPDX-License-Identifier: MulanPSL-2.0
+/** Plugin configuration and request-local resolution for the agent-hint route. */
+import type { Volatile } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
+import type { LaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
+import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+import { deepSeekConfigFields, plainOptions as protocolOptions, resolveAdapterOptions as resolveProtocolOptions } from '@deepseek-ai/dsh-llm-deepseek'
+import type { Config as ProtocolConfig, DeepSeekCatalogModel, DeepSeekConnectionOptions, Options as ProtocolOptions } from '@deepseek-ai/dsh-llm-deepseek'
+import { DEFAULT_CONTROL_RETRIES, DEFAULT_CONTROL_TIMEOUT_MS } from './control-client.js'
+import { DEFAULT_PENDING_OP_AWAIT_MS } from './lifecycle-bridge.js'
+import type { AgentHintPriority } from './hint.js'
+
+/** The provider route this plugin owns; read at plugin load. */
+export const DEFAULT_PROVIDER = 'deepseek-hint'
+/** Last-resort endpoint when neither configuration, a sibling route, nor the environment names one. */
+export const DEFAULT_BASE_URL = 'https://api.deepseek.com'
+/** Environment variable consulted when neither configuration nor a sibling route names an endpoint. */
+export const BASE_URL_ENV = 'DSH_AGENT_HINT_BASE_URL'
+/** Environment variable the official route uses; kept as a second fallback for zero-config installs. */
+export const INHERITED_BASE_URL_ENV = 'DEEPSEEK_BASE_URL'
+
 /**
- * Plugin configuration normalization: raw patch-row config (plain JSON) into
- * validated runtime options. The config is a pure OVERRIDE layer over the DSH
- * host's endpoint/credential facts — absent fields inherit, so the plugin
- * works with zero config. Invalid shapes fail at composition with a field
- * path — never per request. No schemastery: this is an out-of-tree plugin with
- * zero harness runtime dependencies.
- *
- * @module dsh-agent-hints/config
+ * Connection facts a sibling DeepSeek route already resolved. An operator who
+ * can already talk to a model has, by construction, already named the endpoint
+ * this plugin needs; asking them to type it again is the entire configuration
+ * burden this shape removes.
  */
-
-import type { AgentHintCacheControl, AgentHintPriority } from './hint.js'
-import type { PredictionStatic } from './prediction.js'
-
-/** One advisory catalog entry for `resolveModel`. */
-export interface ModelCatalogEntry {
-  id: string
-  name: string
-  contextWindow: number
-  maxTokens: number
+export interface InheritedConnection {
+  /** Endpoint of the sibling route, when it configured one. */
+  baseURL?: string | undefined
+  /** Model catalog of the sibling route, when it declared one. */
+  models?: readonly DeepSeekCatalogModel[] | undefined
+  options?: ProtocolOptions | undefined
+  /** Reference only; secret material is resolved per request. */
+  apiKeyEnv?: string | undefined
 }
 
-/** Priority emission mode: dynamic two-level (default), a static override, or omitted entirely. */
+/** No sibling route contributed anything; the identity value of {@link InheritedConnection}. */
+export const NO_INHERITED_CONNECTION: InheritedConnection = {}
+
+/** Session lifecycle control plane configuration. */
+export interface SessionControlConfig {
+  /** `false` disables manage requests; the static data plane keeps working. */
+  enabled: boolean
+  /** Install stock-host composer Remote and public archive observers. Default: true. */
+  pluginTriggers?: boolean
+  /** Full manage-request URL; omission derives `<baseURL>/v1/chat/completions`. */
+  endpoint?: string | undefined
+  /** Cap on how long an ordinary request waits for an in-flight verb. */
+  pendingOpAwaitMs: number
+  /** Per-attempt control-request timeout in milliseconds. */
+  controlTimeoutMs: number
+  /** Retries of explicit transient HTTP rejections for resume only. */
+  retries: number
+}
+
+/** Priority emission mode: dynamic two-level (default), a static override, or omitted. */
 export type PriorityConfig = 'dynamic' | 'omit' | AgentHintPriority
 
-/** Cache-control emission mode: dynamic single ephemeral entry (default), a static override, or omitted entirely. */
-export type CacheControlConfig = 'dynamic' | 'omit' | AgentHintCacheControl[]
+/** Cache-control emission mode: dynamic single ephemeral entry (default), a static override, or omitted. */
+export interface StaticCacheControl {
+  /** Explicit retention seconds. */
+  ttl_s: number
+  /** Fixed 1-based message offset; omission follows the request's wire message count. */
+  msg_offset?: number | undefined
+}
+export type CacheControlConfig = 'dynamic' | 'omit' | StaticCacheControl
 
-/** Validated plugin configuration. Every field carries an inherited default; the patch-row config only overrides. */
-export interface PluginConfig {
-  /** Upstream endpoint base; every chat request posts to `${baseURL}/chat/completions`. Inherits `$DEEPSEEK_BASE_URL` → the public API default. */
-  baseURL: string
-  /** Credential reference (environment-variable name) resolved per request; inherits `DEEPSEEK_API_KEY`. */
-  apiKeyEnv: string
-  /** Agent type reported as `session.agent_type`. */
-  agentType: string
-  /**
-   * Soft priority. `dynamic` (default): level 3 + `user_waiting` on turn-opening
-   * requests, level 1 + `critical_path` everywhere else. A static object is a
-   * constant override folded into the two-level domain {1, 3}. `omit` never
-   * sends the field.
-   */
+/** The two hint planes: per-request injection and lifecycle control. */
+export interface AgentHintConfig {
+  /** Master switch; false retains the selected transport without hints/controls. */
+  enabled: boolean
+  /** Bounded, content-free Host trace and an optional Session-log mirror. */
+  trace?: { enabled: boolean; maxRecords: number; writeToSession: boolean }
+  /** Soft priority: dynamic two-level, a static override, or omitted entirely. */
   priority: PriorityConfig
-  /**
-   * Cache control. `dynamic` (default): one `ephemeral` entry whose TTL is
-   * derived from the last request interval. A static array overrides the
-   * policy (ephemeral only, explicit `ttl_s`, at most one entry); an entry
-   * without an explicit `range` declares this request's wire message count
-   * (`{end: messages.length, unit: "message"}`) at send time. `omit` never
-   * sends the field.
-   */
+  /** Cache declaration: dynamic derivation, a static override, or omitted entirely. */
   cacheControl: CacheControlConfig
-  /** Deployment thinking policy; `disabled` limits every conversation request to `off`. */
-  thinking?: 'enabled' | 'disabled'
-  /** Default reasoning effort when a request carries none. */
-  reasoningEffort: 'off' | 'low' | 'high' | 'max'
-  /** Advisory model catalog for `resolveModel`; unknown ids fall back to generic metadata. */
-  models: ModelCatalogEntry[]
-  /** Context window assumed for models absent from the catalog. */
-  defaultContextWindow: number
-  /** Per-request output cap materialized when callers omit one. */
-  defaultMaxTokens: number
-  /** Local JSONL sink path for out-of-band status events; unset disables the file sink (the gateway client will replace the sink). */
-  statusSink?: string
-  /** Full status-event endpoint URL; overrides the `statusAuto` derivation when set (non-default paths or a separate status service). */
-  statusEndpoint?: string
-  /** Derive the status endpoint from `baseURL`'s origin (`<origin>/agent-status`, the Motor-coordinator convention) when no explicit `statusEndpoint` is set. */
-  statusAuto?: boolean
-  /** Offline prediction trie file path (built by `scripts/build-prediction-trie.mjs`); enables the `prediction` hint block's distribution values. */
-  predictionTrie?: string
-  /** Static per-field fallbacks for the `prediction` block (dynamo `OptimizableField` analog); configuring this or `predictionTrie` turns the block on. */
-  predictionStatic?: PredictionStatic
-  /** Minimum node sample count for a trie distribution to be trusted over the static value. */
-  predictionMinSamples: number
-  /** Tool names treated as subagent delegation for `derivation.join` and `agent:<name>` status naming. */
-  subagentToolNames: string[]
+  /** Session lifecycle control plane. */
+  sessionControl: SessionControlConfig
 }
 
-export const DEFAULT_AGENT_TYPE = 'agent'
+/** Messages configuration for the agent-hint route, with an optional per-request credential reference. */
+export interface Config extends ProtocolConfig {
 
-/** Built-in advisory catalog, aligned with the official adapter's deepseek-flash family metadata. */
-export const DEFAULT_MODELS: ModelCatalogEntry[] = [
-  { id: 'deepseek-flash', name: 'DeepSeek-V41-Flash', contextWindow: 1_000_000, maxTokens: 256_000 },
-  { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', contextWindow: 1_000_000, maxTokens: 256_000 },
-  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, maxTokens: 256_000 },
-]
+  /**
+   * Credential reference resolved per request. When omitted, a same-endpoint
+   * source reference can inherit unless inheritCredentials is false.
+   */
+  apiKeyEnv: Volatile<string | undefined>
+  inheritCredentials: boolean
+  /** Provider route id; read at plugin load (changing it requires a reload). */
+  provider: string
+  /** Chat is the stock coordinator path; Messages requires backend support. */
+  transport: 'chat' | 'messages'
+  /** The two hint planes. */
+  agentHint?: AgentHintConfig | undefined
+}
 
-const DEFAULT_REASONING_EFFORT = 'high'
-const DEFAULT_CONTEXT_WINDOW = 1_000_000
-const DEFAULT_MAX_TOKENS = 256_000
-const DEFAULT_API_KEY_ENV = 'DEEPSEEK_API_KEY'
-const DEFAULT_PREDICTION_MIN_SAMPLES = 5
+// Preserve omission until inheritance is resolved; defaults belong to the final resolver.
+const optionalProtocolFields = Object.fromEntries(Object.entries(deepSeekConfigFields)
+  .map(([key, schema]) => [key, schema.default(undefined as never)])) as typeof deepSeekConfigFields
 
-/**
- * The inherited endpoint chain, mirroring the official llm-deepseek adapter's
- * own resolution: its settings-section `baseURL` is NOT readable from another
- * plugin (the settings section reader is private to the registrant), but the
- * public fallback sources are — `$DEEPSEEK_BASE_URL` (the official trusted-env
- * knob) then the public API default. Endpoint/credential facts therefore live
- * in the DSH host (launch environment + credentials service) and this plugin's
- * own config becomes a pure per-field override.
+const prioritySchema = z.union([
+  z.const('dynamic'),
+  z.const('omit'),
+  z.object({ level: z.number().required(), reason: z.string().required() }),
+])
+
+const cacheControlSchema = z.union([
+  z.const('dynamic'),
+  z.const('omit'),
+  z.object({ ttl_s: z.natural().min(1).required(), msg_offset: z.natural().min(1) }),
+])
+
+export const Config = z.object({
+  ...optionalProtocolFields,
+  apiKeyEnv: z.string().role('credential-ref').volatile(),
+  inheritCredentials: z.boolean().default(true),
+  provider: z.string().default(DEFAULT_PROVIDER),
+  transport: z.union(['chat', 'messages']).default('chat'),
+  agentHint: z.object({
+    enabled: z.boolean().default(true),
+    trace: z.object({
+      enabled: z.boolean().default(true),
+      maxRecords: z.number().step(1).min(1).max(10_000).default(2000),
+      // Mirrors each attempt's terminal record into the Session log through the
+      // 0.2.2 plugin record channel; stdout keeps every record either way.
+      writeToSession: z.boolean().default(true),
+    }),
+    priority: prioritySchema.default('dynamic'),
+    cacheControl: cacheControlSchema.default('dynamic'),
+    sessionControl: z.object({
+      enabled: z.boolean().default(true),
+      pluginTriggers: z.boolean().default(true),
+      endpoint: z.string(),
+      pendingOpAwaitMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(DEFAULT_PENDING_OP_AWAIT_MS),
+      controlTimeoutMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(DEFAULT_CONTROL_TIMEOUT_MS),
+      retries: z.number().step(1).min(0).max(10).default(DEFAULT_CONTROL_RETRIES),
+    }),
+  }),
+})
+
+/** Plain deployment inputs for the agent-hint route. */
+export type Options = ProtocolOptions & { apiKeyEnv?: string; inheritCredentials?: boolean }
+
+/** Endpoint and credential reference captured from the same configuration generation. */
+export interface ResolvedAgentHintOptions extends DeepSeekConnectionOptions {
+  /** Credential reference used only for this connection snapshot; absent sends unauthenticated requests. */
+  apiKeyEnv: CredentialRef | undefined
+  credentialInherited: boolean
+  authHeader: 'authorization' | 'x-api-key'
+}
+
+/** Read one validated provider configuration.
+ * @param config - live plugin configuration.
+ * @returns detached resolver inputs.
  */
-function inheritedBaseURL(): string {
-  return process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com'
-}
-
-function inheritedApiKeyEnv(): string {
-  return process.env.DEEPSEEK_API_KEY_ENV ?? DEFAULT_API_KEY_ENV
-}
-
-function fail(field: string, expectation: string): never {
-  throw new Error(`agent-hints: config${field} ${expectation}`)
-}
-
-/**
- * Fold one soft-priority level onto the two-level contract domain {1, 3}
- * (admission anchor: 3 = user-intervened, 1 = everything else). Legacy {2, 4}
- * fold to their nearest value and out-of-range values collapse onto the
- * admission line, so the admission verdict never changes.
- */
-export function foldPriorityLevel(level: number): 1 | 3 {
-  return level >= 3 ? 3 : 1
-}
-
-function normalizePriority(raw: unknown, field: string): AgentHintPriority {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) fail(field, 'must be an object')
-  const { level, reason } = raw as Record<string, unknown>
-  if (typeof level !== 'number' || !Number.isFinite(level)) fail(`${field}.level`, 'must be a finite number')
-  if (typeof reason !== 'string') fail(`${field}.reason`, 'must be a string')
-  return { level: foldPriorityLevel(level), reason }
-}
-
-/**
- * Validate one static cache-control override under the retired-`pin` rules:
- * ephemeral only, explicit positive `ttl_s`, at most one entry (single
- * breakpoint), and `message` as the only supported range unit.
- */
-function normalizeCacheEntries(raw: unknown, field: string): 'omit' | AgentHintCacheControl[] {
-  if (!Array.isArray(raw)) fail(field, 'must be an array')
-  if (raw.length === 0) return 'omit'
-  if (raw.length > 1) fail(field, 'must contain at most one entry (a single breakpoint)')
-  return raw.map((entry, index) => {
-    const path = `${field}[${index}]`
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) fail(path, 'must be an object')
-    const { type, ttl_s: ttlS, range } = entry as Record<string, unknown>
-    if (type !== 'ephemeral') fail(`${path}.type`, 'must be "ephemeral" ("pin" is retired)')
-    if (typeof ttlS !== 'number' || !Number.isFinite(ttlS) || ttlS <= 0) {
-      fail(`${path}.ttl_s`, 'must be a positive number (a declaration needs an explicit TTL)')
-    }
-    const normalized: AgentHintCacheControl = { type, ttl_s: ttlS }
-    if (range !== undefined) {
-      if (typeof range !== 'object' || range === null || Array.isArray(range)) fail(`${path}.range`, 'must be an object')
-      const { start, end, unit } = range as Record<string, unknown>
-      const normalizedRange: AgentHintCacheControl['range'] = {}
-      if (start !== undefined) {
-        if (typeof start !== 'number' || !Number.isInteger(start)) fail(`${path}.range.start`, 'must be an integer')
-        normalizedRange.start = start
-      }
-      if (end === null) normalizedRange.end = null
-      else if (end !== undefined) {
-        if (typeof end !== 'number' || !Number.isInteger(end)) fail(`${path}.range.end`, 'must be an integer or null')
-        normalizedRange.end = end
-      }
-      if (unit !== undefined) {
-        if (unit !== 'message') fail(`${path}.range.unit`, 'must be "message"')
-        normalizedRange.unit = unit
-      }
-      normalized.range = normalizedRange
-    }
-    return normalized
-  })
-}
-
-function normalizeModels(raw: unknown, field: string): ModelCatalogEntry[] {
-  if (!Array.isArray(raw)) fail(field, 'must be an array')
-  return raw.map((entry, index) => {
-    const path = `${field}[${index}]`
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) fail(path, 'must be an object')
-    const { id, name, contextWindow, maxTokens } = entry as Record<string, unknown>
-    if (typeof id !== 'string' || id.length === 0) fail(`${path}.id`, 'must be a non-empty string')
-    if (typeof name !== 'string') fail(`${path}.name`, 'must be a string')
-    for (const key of ['contextWindow', 'maxTokens'] as const) {
-      if (typeof entry[key] !== 'number' || !Number.isInteger(entry[key]) || (entry[key] as number) <= 0) {
-        fail(`${path}.${key}`, 'must be a positive integer')
-      }
-    }
-    return { id, name, contextWindow: contextWindow as number, maxTokens: maxTokens as number }
-  })
+export function plainOptions(config: Config): Options {
+  const apiKeyEnv = config.apiKeyEnv.get()
+  return { ...protocolOptions(config), ...apiKeyEnv === undefined ? {} : { apiKeyEnv } }
 }
 
 /**
- * Validate one raw config (patch-row `config` value) into runtime options.
- * The config is a pure OVERRIDE layer: absent fields inherit the DSH host's
- * endpoint/credential facts (`$DEEPSEEK_BASE_URL` → public API default;
- * `DEEPSEEK_API_KEY` credential ref), so the plugin works with ZERO config.
- * Provided-but-invalid values still throw with a field path.
+ * Resolve the coordinator endpoint through a fixed precedence chain.
+ *
+ * An explicit operator value always wins. The built-in public default is the
+ * last resort, so it must never mask an inherited route or the environment: the
+ * whole point of the chain is that a deployment which already reaches a model
+ * needs to configure nothing here.
+ *
+ * @param configured - the resolved plugin configuration value.
+ * @param inherited - endpoint facts read from a sibling route.
+ * @param environment - application launch environment.
+ * @returns the endpoint every request for this route should use.
  */
-export function normalizeConfig(raw: unknown): PluginConfig {
-  const record: Record<string, unknown> = raw === undefined || raw === null
-    ? {}
-    : (() => {
-      if (typeof raw !== 'object' || Array.isArray(raw)) fail('', 'must be an object')
-      return raw as Record<string, unknown>
-    })()
-  const baseURL = record.baseURL === undefined ? inheritedBaseURL() : record.baseURL
-  if (typeof baseURL !== 'string' || !/^https?:\/\//.test(baseURL)) {
-    fail('.baseURL', 'must be an http(s) URL')
+export function resolveBaseURL(
+  configured: string | undefined,
+  inherited: InheritedConnection = NO_INHERITED_CONNECTION,
+  environment?: LaunchEnvironmentSnapshot,
+): string {
+  if (configured !== undefined) return configured
+  const fromRoute = inherited.baseURL
+  if (fromRoute !== undefined && fromRoute.length > 0) return fromRoute
+  for (const name of [BASE_URL_ENV, INHERITED_BASE_URL_ENV]) {
+    const value = environment?.get(name)?.value ?? process.env[name]
+    if (value !== undefined && value.length > 0) return value
   }
-  const apiKeyEnv = record.apiKeyEnv === undefined ? inheritedApiKeyEnv() : record.apiKeyEnv
-  if (typeof apiKeyEnv !== 'string' || apiKeyEnv.length === 0) fail('.apiKeyEnv', 'must be a non-empty string')
-  const agentType = record.agentType === undefined ? DEFAULT_AGENT_TYPE : record.agentType
-  if (typeof agentType !== 'string' || agentType.length === 0) fail('.agentType', 'must be a non-empty string')
-  if (record.thinking !== undefined && record.thinking !== 'enabled' && record.thinking !== 'disabled') {
-    fail('.thinking', 'must be "enabled" or "disabled"')
-  }
-  const reasoningEffort = record.reasoningEffort === undefined ? DEFAULT_REASONING_EFFORT : record.reasoningEffort
-  if (reasoningEffort !== 'off' && reasoningEffort !== 'low' && reasoningEffort !== 'high' && reasoningEffort !== 'max') {
-    fail('.reasoningEffort', 'must be "off", "low", "high", or "max"')
-  }
-  const models = record.models === undefined ? DEFAULT_MODELS : normalizeModels(record.models, '.models')
-  const defaultContextWindow = record.defaultContextWindow === undefined ? DEFAULT_CONTEXT_WINDOW : record.defaultContextWindow
-  if (typeof defaultContextWindow !== 'number' || !Number.isInteger(defaultContextWindow) || defaultContextWindow <= 0) {
-    fail('.defaultContextWindow', 'must be a positive integer')
-  }
-  const defaultMaxTokens = record.defaultMaxTokens === undefined ? DEFAULT_MAX_TOKENS : record.defaultMaxTokens
-  if (typeof defaultMaxTokens !== 'number' || !Number.isInteger(defaultMaxTokens) || defaultMaxTokens <= 0) {
-    fail('.defaultMaxTokens', 'must be a positive integer')
-  }
-  const priority: PriorityConfig = record.priority === undefined
-    ? 'dynamic'
-    : record.priority === null ? 'omit' : normalizePriority(record.priority, '.priority')
-  const cacheControl: CacheControlConfig = record.cacheControl === undefined
-    ? 'dynamic'
-    : record.cacheControl === null ? 'omit' : normalizeCacheEntries(record.cacheControl, '.cacheControl')
+  return DEFAULT_BASE_URL
+}
+
+/** Resolve the model catalog: explicit configuration, then the sibling route's.
+ * @param configured - models declared on this plugin's own entry.
+ * @param inherited - model catalog read from a sibling route.
+ * @returns the catalog to advertise; empty when neither source declared one.
+ */
+export function resolveModels(
+  configured: DeepSeekCatalogModel[] | undefined,
+  inherited: InheritedConnection = NO_INHERITED_CONNECTION,
+): DeepSeekCatalogModel[] {
+  if (configured !== undefined) return [...configured]
+  const fromRoute = inherited.models
+  return fromRoute === undefined ? [] : [...fromRoute]
+}
+
+/** Resolve route and protocol settings together.
+ * @param config - raw deployment settings.
+ * @param environment - application launch environment.
+ * @param inherited - endpoint facts read from a sibling route.
+ * @returns validated endpoint facts and the matching credential reference, or `undefined` when the route names none.
+ */
+export function resolveAdapterOptions(
+  config: Options,
+  environment?: LaunchEnvironmentSnapshot,
+  inherited: InheritedConnection = NO_INHERITED_CONNECTION,
+): ResolvedAgentHintOptions {
+  const baseURL = resolveBaseURL(config.baseURL, inherited, environment)
+  const sameEndpoint = inherited.baseURL !== undefined
+    && new URL(baseURL).href.replace(/\/+$/, '') === new URL(inherited.baseURL).href.replace(/\/+$/, '')
+  const credentialInherited = config.apiKeyEnv === undefined && config.inheritCredentials !== false
+    && sameEndpoint && inherited.apiKeyEnv !== undefined
+  const apiKeyEnv = config.apiKeyEnv ?? (credentialInherited ? inherited.apiKeyEnv : undefined)
+  const explicit = Object.fromEntries(Object.entries(config).filter(([, value]) => value !== undefined))
   return {
-    baseURL: baseURL.replace(/\/+$/, ''),
-    apiKeyEnv,
-    agentType,
-    priority,
-    cacheControl,
-    thinking: record.thinking as PluginConfig['thinking'],
-    reasoningEffort,
-    models,
-    defaultContextWindow,
-    defaultMaxTokens,
-    statusSink: record.statusSink === undefined ? undefined : normalizeSinkPath(record.statusSink),
-    statusEndpoint: record.statusEndpoint === undefined ? undefined : normalizeEndpoint(record.statusEndpoint),
-    statusAuto: record.statusAuto === undefined ? false : normalizeBoolean(record.statusAuto),
-    predictionTrie: record.predictionTrie === undefined ? undefined : normalizePath(record.predictionTrie, '.predictionTrie'),
-    predictionStatic: record.predictionStatic === undefined ? undefined : normalizePredictionStatic(record.predictionStatic),
-    predictionMinSamples: record.predictionMinSamples === undefined ? DEFAULT_PREDICTION_MIN_SAMPLES : normalizePositiveInteger(record.predictionMinSamples, '.predictionMinSamples'),
-    subagentToolNames: record.subagentToolNames === undefined
-      ? ['subagent']
-      : normalizeStringList(record.subagentToolNames, '.subagentToolNames'),
+    ...resolveProtocolOptions({ ...inherited.options, ...explicit, baseURL, models: resolveModels(config.models, inherited) }, environment),
+    apiKeyEnv: apiKeyEnv === undefined ? undefined : credentialRef(apiKeyEnv),
+    credentialInherited,
+    authHeader: credentialInherited ? 'x-api-key' : 'authorization',
   }
-}
-
-function normalizeSinkPath(raw: unknown): string {
-  if (typeof raw !== 'string' || raw.length === 0) fail('.statusSink', 'must be a non-empty string')
-  return raw
-}
-
-function normalizePath(raw: unknown, field: string): string {
-  if (typeof raw !== 'string' || raw.length === 0) fail(field, 'must be a non-empty string')
-  return raw
-}
-
-function normalizePredictionStatic(raw: unknown): PredictionStatic {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) fail('.predictionStatic', 'must be an object')
-  const record = raw as Record<string, unknown>
-  const normalized: PredictionStatic = {}
-  for (const field of ['latency_ms', 'remaining_calls', 'output_tokens', 'interval_ms', 'remaining_time_ms'] as const) {
-    const value = record[field]
-    if (value === undefined) continue
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-      fail(`.predictionStatic.${field}`, 'must be a non-negative finite number')
-    }
-    normalized[field] = value
-  }
-  return normalized
-}
-
-function normalizePositiveInteger(raw: unknown, field: string): number {
-  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0) fail(field, 'must be a positive integer')
-  return raw
-}
-
-function normalizeEndpoint(raw: unknown): string {
-  if (typeof raw !== 'string' || !/^https?:\/\//.test(raw)) fail('.statusEndpoint', 'must be an http(s) URL')
-  return raw
-}
-
-function normalizeBoolean(raw: unknown): boolean {
-  if (typeof raw !== 'boolean') fail('', 'boolean fields must be true or false')
-  return raw
-}
-
-function normalizeStringList(raw: unknown, field: string): string[] {
-  if (!Array.isArray(raw)) fail(field, 'must be an array')
-  return raw.map((entry, index) => {
-    if (typeof entry !== 'string' || entry.length === 0) fail(`${field}[${index}]`, 'must be a non-empty string')
-    return entry
-  })
 }

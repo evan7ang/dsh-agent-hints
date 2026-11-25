@@ -1,141 +1,138 @@
 # dsh-agent-hints
 
-面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的逐请求服务意图 hint 插件：每次主请求在 **`X-Agent-Hint` HTTP 头**（UTF-8 JSON，base64url）上携带结构化 AgentHint——会话身份、agent 状态、优先级、缓存控制——让推理网关等服务引擎能够观察并响应 agent 的当前状态，即"Agent 发信号、引擎认信号"范式。
+面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的逐请求 Agent Hint 插件：注册一个 provider 路由，其模型请求携带一个结构化的 **`X-Agent-Hint`** 头（UTF-8 JSON，base64url）——会话身份、生命周期状态、二值优先级与缓存声明；会话生命周期驱动有界的 manage 请求。请求体永不携带 hint 字段。
 
-插件注册**独立 provider 路由 `deepseek-hint`**，由自实现的 chat-completions 适配器承载。官方 `deepseek-official` 路由保持 mounted 并作为兜底；部署经 `agent-default-model.provider` 切换。零 harness 源码修改、零 harness 运行时依赖（运行时服务仅以结构化鸭子类型触碰）。
+插件注册独立 provider 路由（**默认 `deepseek-hint`**），支持 Chat Completions 与官方 Messages 两条传输；从同级 `llm-deepseek` 路由继承地址、模型目录与凭据引用；并安装宿主侧的 composer 观察器，让浏览器草稿输入可以提前触发 `resume`。
 
-[English](README.md) | 中文 · 设计记录：[docs/design.zh.md](docs/design.zh.md)（[English](docs/design.md)）
+[English](README.md) | 中文 · 合同：[传输](docs/transport.md) · [可靠性](docs/reliability.md) · [配置继承](docs/endpoint-inheritance.md) · [trace](docs/trace.md)
 
-## 工作原理
+## Wire 契约
 
-harness `LlmAdapter` 契约极薄（仅 `stream()` 必需），而官方适配器在其 `request()` 实现内部构造 HTTP 头、无扩展点。因此本插件自实现适配器契约并追加一个头：
-
-```http
-POST {baseURL}/chat/completions
-authorization: Bearer …
-content-type: application/json
-x-deepseek-harness-session-id: session-…          ← 身份信号，对齐官方适配器约定
-x-agent-hint: eyJzZXNzaW9uIjp7InNlc3Npb25faWQi…   ← UTF-8 JSON AgentHint 的 base64url
-```
-
-请求体保持 provider 原生 chat-completions 格式，**永不携带 hint 字段**。对不理解该头的端点，它只是无害的未知头。
-
-与静态头注入方案（如包装 `fetch` 固定改写 `user-agent`）不同：hint 值**逐请求动态派生**自会话的持久化事件日志（调用序号、compaction epoch、最近一次工具结果时刻）与会话血缘——没有可静态配置的值。
-
-### 发射规则
-
-- **仅主请求发射**：辅助调用（`compaction` / `session-title` purpose）与无会话身份的请求不加头。
-- `strict_priority` **永不发送**（可信控制面字段）。
-- `agent_status` 遵循四值契约：默认 `running`；存在未应答的工具调用时 `pause`（按本部署裁决，任何工具调用都视为在等外部结果）；放行后的第一条请求 `resume`（只报一条）。`finalize` 不上 header——跑完一轮没有收尾请求——它是会话级语义（会话结束、释放会话级资源），由 `session/disposed` 状态事件承载，每个会话生命周期恰好一条且为该会话最后一条事件。
-- `priority` 默认动态二值：turn 开局请求 = 用户介入（`3` / `user_waiting`），其余为自驱续接（`1` / `critical_path`）。静态 `{level, reason}` 为常量覆盖并折叠进 `{1, 3}`；`null` 省略字段。
-- `cache_control` 默认单条动态 `ephemeral`：`range.end` 为本次 wire 消息条数，`ttl_s = clamp(最近间隔 × 2, 60, 3600)`。压缩当轮、模型/工具集变化、前缀估算不足 128 token 时抑制声明。静态数组覆盖策略（仅 `ephemeral`、显式 `ttl_s`）；条目未显式给 `range` 时按本次 wire 消息条数补 `range.end` + `unit: message`。`null` 省略。
-- `prediction` 在配置了来源时随同一头发射（`predictionTrie` 和/或 `predictionStatic`）；未配置来源时整块省略，wire 形状不变。取值来自离线 trie（工具序列最长前缀匹配），逐字段静态回退。
-- 身份信号与官方适配器对齐：`x-deepseek-harness-session-id`（有会话 id 时）与 `x-deepseek-harness-compact: 1`（compaction 时）照发。
-
-### `X-Agent-Hint` 载荷
+只有四块：
 
 ```jsonc
+// 普通请求：全新会话的首条
 {
-  "session": {
-    "session_id": "session-…",
-    "agent_type": "agent",
-    "call_index": 7,          // 派生自会话持久化日志（step/start 计数）；重启安全
-    "epoch": 0                // 派生自 compaction/end 计数；重启安全
-    // "parent_session_id" / "derivation": {"relation": "spawn"|"fork", "join": "sync"|"async"} — 仅有血缘的会话携带
-  },
-  "agent_status": { "state": "running", "state_since_ms": 1760000000000 },  // running | pause | resume
-  "priority": { "level": 3, "reason": "user_waiting" },           // 动态二值；可静态覆盖；null 省略
-  "cache_control": [{ "type": "ephemeral", "ttl_s": 600, "range": { "end": 3, "unit": "message" } }],  // 动态；null 省略
-  // "prediction": { "latency_ms": 8251, "remaining_calls": 2, "output_tokens": 640,
-  //   "interval_ms": 251, "remaining_time_ms": 42000,
-  //   "next_action": { "state": "tool", "tools": [{"name": "web_search", "expected_duration_s": 9}], "prob": 0.8 } }
-  //   — 仅在配置 predictionTrie/predictionStatic 时出现；trie 未命中逐字段回退静态值
+  "session": { "session_id": "s-1", "parent_session_id": "p-1", "call_index": 1, "epoch": 0, "state": "start" },
+  "priority_control": { "priority": { "level": 3, "reason": "user_waiting" } },
+  "cache_control": { "type": "ephemeral", "ttl_s": 600, "msg_offset": 10 }
+}
+
+// 普通请求：其余全部
+{
+  "session": { "session_id": "s-1", "call_index": 5, "epoch": 1, "state": "append" },
+  "priority_control": { "priority": { "level": 1, "reason": "critical_path" } },
+  "cache_control": { "type": "ephemeral", "ttl_s": 300, "msg_offset": 12 }
+}
+
+// manage 请求：body 只是占位（{ model, messages: [], stream: false }）
+{
+  "session": { "session_id": "s-1", "call_index": 5, "epoch": 1, "state": "pause" },
+  "context_management": { "manage_request": true,
+                          "edits": [{ "type": "offload", "target": "session" }] }
 }
 ```
 
-带外状态事件（每个工作会话 `pause` → `running` → `finalize`，含等待中的工具名与 call id）上报到可选的 `statusSink`（本地 JSONL 文件）；`emit()` 接缝供网关客户端接管。
+- `state` 共 6 值：`start` / `append` / `pause` / `resume` / `stop` / `compact`。`start` 在每个全新会话中恰好出现一次，其余普通请求一律 `append`。
+- 生命周期动词各占一条 manage 请求：`pause` → `offload`、`resume` → `prefetch`、`stop` → `evict`、`compact` → `evict`，`target` 为 `session`。`compact` 携带被驱逐的旧 epoch。
+- 辅助调用（任意非空 `purpose`，如压缩摘要、会话标题）不携带任何 hint。
+- 请求体与 provider 原生格式逐字节一致；hint 只存在于请求头。
+
+### 生命周期触发
+
+| state | 触发 |
+| --- | --- |
+| `start` | 全新（不带历史）会话的首条被接受的普通请求 |
+| `append` | 其余普通请求 |
+| `pause` | 另一会话的普通请求被接受，且本会话 agent 空闲、在途流结束 |
+| `resume` | 带历史/已 pause 会话的下一条普通请求前；或浏览器草稿由空变非空 |
+| `stop` | 会话销毁，或成功归档 |
+| `compact` | `compaction/end` 且无 error |
+
+### 优先级与缓存
+
+- `priority_control` 随每条普通请求发出：turn 开局请求为 `3` / `user_waiting`，自驱续接为 `1` / `critical_path`。静态 `{ level, reason }` 为常量覆盖；`"omit"` 省略。
+- `cache_control` 每条符合条件的普通请求一条 `ephemeral` 声明：`msg_offset` 等于本次 wire 消息条数，`ttl_s = clamp(上次间隔 × 2, 60, 3600)`。压缩当轮、模型/工具集变化、前缀估算不足 128 token 时抑制。静态 `{ ttl_s, msg_offset? }` 覆盖策略；`"omit"` 省略。
+
+## 传输
+
+- **Chat**（默认）：插件自实现的 Chat Completions 适配器逐请求写入请求头，保留角色、工具调用/结果 id 与 reasoning 历史。原生图片/文件明确报 `UNSUPPORTED_CONTENT`，不会静默丢弃。
+- **Messages**：官方 `DeepSeekAdapter` 管线（含附件）。它没有 per-request header 钩子，插件用 AsyncLocalStorage 绑定当前请求的 hint，并在 `resolveAuth` 中写入 `x-agent-hint`。宿主日后提供正式钩子时应替换该接缝。
 
 ## 安装
 
-本仓**随源提交构建产物**（`lib/`），从 GitHub 安装**无需放行构建脚本**：
+构建产物已提交入库（`lib/`），从 GitHub 安装无需构建脚本权限：
 
-```sh
-dsh plugin add github:evan7ang/dsh-agent-hints
+```bash
+dsh plugin --profile <your-profile> add github:<owner>/dsh-agent-hints#<commit>
 ```
 
-可固定 commit：`dsh plugin add github:evan7ang/dsh-agent-hints#<sha>`。npm 包（`dsh plugin add dsh-agent-hints`）已列入计划、暂未发布。
+或在本地构建后安装 tarball：
 
-## 配置与部署
+```bash
+npm ci
+npm run check
+npm pack
+dsh plugin --profile <your-profile> add "$PWD"/dsh-agent-hints-0.4.0.tgz
+```
 
-插件在指向上游之前处于惰性状态。在 profile 的 `cordis.patch.yml` 里按行 id 覆盖配置（后层替换整行 `config`，需要的键要全部重述）：
+需要 Node `^22.19.0 || >=24` 与 DSH **0.2.2-rc.1**。重启实例后把 `agent-default-model.provider` 指向本路由（默认 `deepseek-hint`）。
+
+## 配置
+
+同级 `llm-deepseek` 路由已配置时零配置即可用：地址、模型目录与凭据引用都会继承。下列字段逐项覆盖继承值。
 
 ```yaml
 - id: agent-hints
   config:
-    baseURL: https://your-gateway.example.com
-    apiKeyEnv: MY_GATEWAY_KEY
+    provider: deepseek-hint        # provider 路由 id（改动需重载）
+    transport: chat                # chat | messages
+    baseURL: http://127.0.0.1:1025 # 可选；继承 > DSH_AGENT_HINT_BASE_URL > DEEPSEEK_BASE_URL
+    apiKeyEnv: MOTOR_API_KEY       # 可选凭据引用；同端点来源可继承
+    inheritCredentials: true
+    models:
+      - id: served-model
+        name: Served Model
+        contextWindow: 32768
+        maxTokens: 4096
+    agentHint:
+      enabled: true
+      priority: dynamic            # dynamic | omit | { level, reason }
+      cacheControl: dynamic        # dynamic | omit | { ttl_s, msg_offset? }
+      sessionControl:
+        enabled: true
+        pluginTriggers: true       # 宿主侧 composing Remote 与公开归档观察
+        pendingOpAwaitMs: 2000
+        controlTimeoutMs: 5000
+        retries: 1
+      trace:
+        enabled: true
+        maxRecords: 2000
+        writeToSession: true
 ```
 
-再切换模型路由：
+`agentHint.enabled: false` 时路由退化为普通模型路由，不发 hint、不做生命周期控制。非法取值在组合期带字段路径报错。
 
-```yaml
-# $DSH_HOME/settings.yaml
-agent-default-model:
-  provider: deepseek-hint
-  model: deepseek-flash
+## 消费端要求
+
+请求头是增量且对不认识的端点无害，但生命周期动词与优先级准入只有在消费端解析归一化 header 后才生效：
+
+1. 在请求校验前解码 `X-Agent-Hint`，`context_management.manage_request` 为真时允许空 `messages`。
+2. 把 `session.state` 映射到消费端自己的生命周期词表（`start`/`append` 不触发上下文动作）。
+3. 把 `context_management` 映射到引擎可见形态；优先级从 `priority_control.priority.{level, reason}` 读取。
+4. `cache_control.{ttl_s, msg_offset}` 取代旧的 `{ttl, msg_offset}` 声明。
+
+在消费端跟进前，普通请求仍会携带会话身份与缓存声明；manage 请求会被拒绝并记录为失败。
+
+## 验证
+
+```bash
+npm run check                    # 类型检查、构建、单测/集成测试、包内容检查
+bash e2e/run.sh                  # 免 key wire e2e（DSH 0.2.2-rc.1）
 ```
 
-API key 逐请求解析：credentials 服务优先（`$DSH_HOME/.credentials.yaml` / Models 页写入），其次解析 `apiKeyEnv` 指定的环境变量——与官方适配器同序。
+e2e 会把本包安装到临时 profile，跑两轮 headless（全新会话，再收养同一会话），对着捕获 stub 断言 header 形状、`start`/`append`、`resume` manage 请求、已派发的 `stop`、占位 body 与无 hint 的标题请求。浏览器打字触发由组件测试覆盖；真实浏览器验收仍待执行。
 
-### 配置参考
+## 许可
 
-| 字段 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `baseURL` | string | 继承 `$DEEPSEEK_BASE_URL` → `https://api.deepseek.com` | 上游地址基座；每次请求 POST 到 `${baseURL}/chat/completions` |
-| `apiKeyEnv` | string | 继承 `$DEEPSEEK_API_KEY_ENV` → `DEEPSEEK_API_KEY` | 逐请求解析的环境变量名（credentials 服务优先） |
-| `agentType` | string | `agent` | 上报为 `session.agent_type` |
-| `priority` | `"dynamic"`、`{level, reason}` 或 `null` | `"dynamic"` | 二值软优先级。动态：开局请求 `3`/`user_waiting`，其余 `1`/`critical_path`。静态对象折叠进 `{1, 3}`；`null` 省略字段 |
-| `cacheControl` | `"dynamic"`、数组或 `null` | `"dynamic"` | 动态：单条 `ephemeral` + 推导 TTL。静态数组覆盖策略（仅 `ephemeral`、显式 `ttl_s`、至多一条）；条目未给 `range` 时按本次 wire 消息条数声明。`null` 省略字段 |
-| `thinking` | `"enabled"` / `"disabled"` | enabled | `disabled` 将所有会话请求的 thinking 限制为 `off` |
-| `reasoningEffort` | `"off"/"low"/"high"/"max"` | `high` | 请求未携带时的默认推理力度 |
-| `models` | `{id, name, contextWindow, maxTokens}[]` | DeepSeek-V4 家族目录 | `resolveModel` 的咨询模型目录；**指向自有网关时必须提供真实限额**（供 compaction 决策使用） |
-| `defaultContextWindow` | 正整数 | `1000000` | 目录外模型假定的上下文窗口 |
-| `defaultMaxTokens` | 正整数 | `256000` | 调用方缺省时物化的单请求输出上限 |
-| `statusSink` | string | 未设（文件 sink 关闭） | 带外状态事件的本地 JSONL 路径 |
-| `statusEndpoint` | string | 未设 | 状态事件端点全 URL（Motor 调度端）；优先于 `statusAuto` 推导 |
-| `statusAuto` | boolean | `false` | 从 `baseURL` 的 origin 推导状态端点（`<origin>/agent-status`） |
-| `predictionTrie` | string | 未设（prediction 块关闭） | 离线预测 trie（`scripts/build-prediction-trie.mjs` 构建）；启用 trie 来源的 `prediction` 取值 |
-| `predictionStatic` | 对象 | 未设 | 逐字段静态回退（`latency_ms`/`remaining_calls`/`output_tokens`/`interval_ms`/`remaining_time_ms`）；配置本项或 `predictionTrie` 即开启 `prediction` 块 |
-| `predictionMinSamples` | 正整数 | `5` | trie 节点分布被采信所需的最低样本数（低于则回退静态值） |
-| `subagentToolNames` | string[] | `["subagent"]` | 视为子 agent 委派的工具名（用于 `derivation.join` 与状态命名） |
-
-配置在装载阶段严格校验，非法即组合失败并带字段路径——请求期 hint 构造没有失败路径。
-
-## 已知边界（v1）
-
-- 仅 chat-completions wire；子集：text + tools + thinking + usage + abort。图片/文件内容显式拒绝（`UNSUPPORTED_CONTENT`），不静默降级。
-- 协议子集需手动跟进官方适配器演进（部署目标是自有网关，子集可控）。
-- `call_index`/`epoch`/`state_since_ms` 派生自会话事件日志，依赖 harness 事件语义（`step/start` 前置于派发；辅助调用不进 loop step 计数）。
-- 工具等待统一报 `pause`（本部署裁决）：四值契约“工具执行中也算 running”的字面在发送侧折叠，消费方对每次等待工具都看到 `pause`。
-- `resume` 一次性语义在 harness 重试时会重发——发送方无法感知 header 是否送达。
-- 人工审批的优先级加成未实现：工具门与人工门不可区分，`level: 3` 仅覆盖开局请求。
-- `cache_control` 的 TTL 只用最近请求间隔；“下一工具预计耗时”信号需要 `prediction.next_action`，本部署不配置该项。
-- `derivation.join` 取父会话最近一次委托工具调用——并行委托共享最新值（可接受近似）。
-- 切回 `deepseek-official` 路由会静默失去 hint；下列 e2e wire 断言是兜底。
-- **始终思考的模型**：session-title 辅助调用固定发 `thinking: {type: "disabled"}`（官方约定）。以始终思考模型为后端的网关（如火山引擎 `glm-5.3-flash`）会拒绝该请求并报错；harness 会容忍该失败——任务本身不受影响——但这类会话没有生成的标题。辅助调用建议换用支持关闭思考的模型，或接受无标题会话（已在真实网关实测：主线请求 `thinking: enabled` + `reasoning_effort` 被接受、任务 exit 0、hint 头到达网关）。
-
-## 开发
-
-```sh
-npm install
-npm run build        # src/ → lib/（构建产物随源提交）
-npm test             # node --test 运行于构建产物
-e2e/run.sh           # keyless wire e2e（真实 harness）：工具往返、前台子代理委派、
-                     # 会话复用与溢出压缩轮，逐字段断言 hint
-```
-
-e2e 的 `dsh` 运行时解析顺序：`DSH_BIN` > `PATH` > deepseek-harness checkout（`DSH_CHECKOUT` 或兄弟目录）。
-
-## License
-
-[MulanPSL-2.0](LICENSE)
+MulanPSL-2.0。部分代码来自 MIT 许可的 `dsh-agenthint` 插件与 DeepSeek Harness AgentHint 集成分支，见 [NOTICE](NOTICE)。

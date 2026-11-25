@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 /**
- * Dynamic `cache_control` derivation per the implementation guide: one
- * ephemeral declaration per main-line request declaring "keep the current
- * prefix for N more seconds".
+ * Dynamic `cache_control` derivation: one `ephemeral` declaration per main-line
+ * request declaring "keep the current prefix for N more seconds", with the
+ * effective point expressed as a 1-based `msg_offset` (the request's wire
+ * message count).
  *
  * TTL policy: `clamp(gap × 2, 60, 3600)` where `gap` is the latest observed
  * request interval (response end → request start); the factor 2 tolerates the
@@ -12,27 +13,27 @@
  * (128 tokens) is pointless and therefore omitted. All functions are pure so
  * the value policy is unit-testable without a harness.
  *
- * @module dsh-agent-hints/cache
+ * @module @deepseek-ai/dsh-agent-hints/cache
  */
 
 import type { AgentHintCacheControl } from './hint.js'
 
-/** Lower clamp bound: declarations below this are raised (guide §2.3). */
+/** Lower clamp bound: declarations below this are raised. */
 export const TTL_MIN_S = 60
-/** Upper clamp bound: declarations above this are truncated, never dropped (guide §2.3). */
+/** Upper clamp bound: declarations above this are truncated, never dropped. */
 export const TTL_MAX_S = 3600
-/** Gap assumed when no interval sample exists (guide §4.2). */
+/** Gap assumed when no interval sample exists. */
 export const TTL_FALLBACK_GAP_S = 300
-/** Safety factor over the estimated gap (guide §4.3). */
+/** Safety factor over the estimated gap. */
 export const TTL_FACTOR = 2
-/** The engine stores whole KV blocks; a shorter prefix cannot be cached (guide §2.3). */
+/** The engine stores whole KV blocks; a shorter prefix cannot be cached. */
 export const MIN_PREFIX_TOKENS = 128
 
 /**
- * CJK-aware prefix size estimate (guide §6.2): one token per CJK/full-width
- * character, one token per four other characters. Under-estimation is the
- * benign direction (a skipped declaration), over-estimation is clamped by the
- * engine's own block threshold.
+ * CJK-aware prefix size estimate: one token per CJK/full-width character, one
+ * token per four other characters. Under-estimation is the benign direction
+ * (a skipped declaration), over-estimation is clamped by the engine's own
+ * block threshold.
  * @param messages - the wire messages actually being sent.
  */
 export function estimatePrefixTokens(messages: readonly unknown[]): number {
@@ -71,7 +72,7 @@ export function deriveTtlS(intervalMs: number | undefined): number {
 
 /**
  * Assemble the single ephemeral declaration for one request.
- * @param logicalMessageCount - the wire message count of this request (`[system?] + messages`); becomes `range.end`.
+ * @param logicalMessageCount - the wire message count of this request; becomes `msg_offset`.
  * @param prefixTokens - the estimated prefix size; below one block the declaration is omitted.
  * @param intervalMs - the interval sample feeding the TTL.
  */
@@ -79,14 +80,14 @@ export function buildCacheControl(
   logicalMessageCount: number,
   prefixTokens: number,
   intervalMs: number | undefined,
-): AgentHintCacheControl[] | undefined {
+): AgentHintCacheControl | undefined {
   if (!Number.isSafeInteger(logicalMessageCount) || logicalMessageCount < 1) return undefined
   if (prefixTokens > 0 && prefixTokens < MIN_PREFIX_TOKENS) return undefined
-  return [{
+  return {
     type: 'ephemeral',
     ttl_s: deriveTtlS(intervalMs),
-    range: { end: logicalMessageCount, unit: 'message' },
-  }]
+    msg_offset: logicalMessageCount,
+  }
 }
 
 /**

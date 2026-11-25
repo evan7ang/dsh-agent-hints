@@ -1,5 +1,7 @@
 # Design: serving-intent hints on the `X-Agent-Hint` header
 
+> **Superseded (2026-11-25):** the wire protocol is now the four-block `X-Agent-Hint` header (`session` / `context_management` / `priority_control` / `cache_control`). The `agent_status` block, `prediction`, out-of-band status events and body-side hints described below no longer apply. See [merged header protocol](design/20261125-01-merged-header-protocol.md).
+
 > Status: v1 (2026-10-13). This document records the design of the published `dsh-agent-hints` plugin: an out-of-tree DSH bundle plugin that carries structured serving-intent hints on the `X-Agent-Hint` HTTP header (UTF-8 JSON, base64url) of every main-line model request, so a serving engine (the deployment's inference gateway) can decode and consume them — the "agent signals, engine consumes" pattern. The user-facing summary lives in the [README](../README.md); this document is the design rationale.
 
 ## 1. Goals and boundaries

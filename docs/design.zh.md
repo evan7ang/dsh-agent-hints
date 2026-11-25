@@ -1,5 +1,7 @@
 # 设计：`X-Agent-Hint` 头上的服务意图 hint
 
+> **已被取代（2026-11-25）**：wire 协议已归一化为四块 `X-Agent-Hint` header（`session` / `context_management` / `priority_control` / `cache_control`）。本文描述的 `agent_status`、`prediction`、带外状态事件与请求体 hint 均不再适用。见[合并与协议归一化设计](design/20261125-01-merged-header-protocol.md)。
+
 > 状态：v1（2026-10-13）。本文记录已发布插件 `dsh-agent-hints` 的设计：一个仓外 DSH bundle 插件，在每次主请求的 `X-Agent-Hint` HTTP 头（UTF-8 JSON，base64url）上携带结构化服务意图 hint——会话身份、agent 状态、优先级、缓存控制——供服务引擎（部署方的推理网关）解码消费，即"Agent 发信号、引擎认信号"范式。面向使用者的摘要见 [README](../README.zh.md)；本文是设计依据。
 
 ## 1. 目标与边界

@@ -1,201 +1,325 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 /**
- * The agent hints plugin: per-request serving-intent hints carried on the
- * `X-Agent-Hint` HTTP header (UTF-8 JSON, base64url) of DeepSeek
- * chat-completions requests. The plugin
- * registers an independent provider route (`deepseek-hint`) backed by its own
- * structural LlmAdapter implementation — the official `llm-deepseek` route
- * stays untouched and remains the fallback. Self-contained: no harness-internal
- * runtime imports.
+ * Register the agent-hint route: Chat or DeepSeek Messages aimed at a
+ * coordinator or gateway that understands the normalized `X-Agent-Hint` header
+ * (session identity, two-level priority, dynamic cache declaration) and whose
+ * session lifecycle events plus the first ordinary request of a fresh session
+ * drive the `start` / `pause` / `resume` / `stop` / `compact` states through
+ * dedicated manage requests.
  *
- * Header emission rules:
- * - main-line requests only: auxiliary calls (purpose compaction/session-title)
- *   and requests without a session identity carry no hint;
- * - `strict_priority` is never sent by an agent (trusted-control-plane field);
- * - `agent_status` follows the four-value contract: `running` by default,
- *   `pause` while a tool call is unanswered, `resume` on the first request
- *   after a release. `finalize` never rides the header (a completed run has no
- *   closing request) — it rides the `session/disposed` status event, once per
- *   session lifetime (session-scoped, never per turn);
- * - `priority` is the dynamic two-level value by default (turn opening =
- *   3/`user_waiting`, otherwise 1/`critical_path`); a static config is folded
- *   into {1, 3}; `null` omits the field;
- * - `cache_control` is one dynamic `ephemeral` entry with a derived TTL by
- *   default; a static array overrides the policy (type/ttl), with an absent
- *   `range` filled from the request's wire message count; `null` omits it;
- * - `prediction` rides the header only when `predictionTrie`/`predictionStatic`
- *   is configured.
- * The request body keeps the provider's original format and NEVER carries
- * hint fields.
+ * The request body never carries hint fields. The endpoint and model catalog
+ * fall back to the sibling DeepSeek route, so an operator using a compatible
+ * backend avoids duplicate configuration. Messages uses the official pipeline;
+ * Chat owns its protocol mapping and model contract; connection facts resolve
+ * per request. Credentials may inherit only for the same endpoint. Prefetch is
+ * advisory; pending or unknown cache mutations block new ordinary requests in
+ * the affected session.
  *
- * Serving facts (`call_index`/`epoch`/`state`/`state_since_ms`/`turnOpening`/
- * `intervalMs`/`afterCompaction`) are derived from the session's durable event
- * log at request time — restart-safe (restored sessions replay their log).
- * `derivation.join` comes from the parent's delegating tool call
- * (`run_in_background`). The out-of-band status channel (pause/running/finalize
- * events) activates when any sink is configured (`statusSink` JSONL file
- * and/or the `statusEndpoint`/`statusAuto` HTTP endpoint).
- *
- * @module dsh-agent-hints
+ * @module @deepseek-ai/dsh-agent-hints
  */
 
-import type { Context, SessionLike, SessionEventLike } from '@deepseek-ai/cordis'
-import type { AgentHintPrediction, AgentHintPriority, HintOptions, ServingFacts } from './hint.js'
-import { deriveServingFacts } from './hint.js'
-import { HintedDeepSeekAdapter } from './adapter.js'
-import { normalizeConfig } from './config.js'
-import { loadPredictionTrie, resolvePredictionBlock, toolSequenceOf, type PredictionSource } from './prediction.js'
-import { HttpStatusSink, StatusObserver, appendStatusEvent, type StatusEvent } from './status.js'
+import type { Context } from '@deepseek-ai/cordis'
+import { assertUsableApiKey, LlmError, resolveImageAttachmentAccess } from '@deepseek-ai/dsh-llm'
+import type {} from '@deepseek-ai/cordis-plugin-loader'
+import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
+import { catalogModelInfo } from '@deepseek-ai/dsh-llm-deepseek'
+import { getOrCreateAnonymousUserId } from '@deepseek-ai/dsh-anonymous-user-id'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-api-gateway'
+import { Config, plainOptions, resolveAdapterOptions } from './config.js'
+import type { CacheControlConfig, PriorityConfig, ResolvedAgentHintOptions } from './config.js'
+import { AgentHintAdapter, agentHintScope } from './adapter.js'
+import { ChatCompletionsAdapter, chatCompletionsURL } from './chat-adapter.js'
+import { buildOrdinaryHint, deriveServingFacts, encodeAgentHintHeader } from './hint.js'
+import type { AgentHintCacheControl, AgentHintPriority, ServingFacts } from './hint.js'
+import { buildCacheControl, cacheSignature } from './cache.js'
+import { readInheritedConnection, INHERIT_SOURCE_ID } from './inherited-connection.js'
+import { DEFAULT_CONTROL_RETRIES, DEFAULT_CONTROL_TIMEOUT_MS, SessionControlClient } from './control-client.js'
+import type { ManageSessionFacts } from './control-client.js'
+import { agentHintAcceptExtensions } from './extension.js'
+import { DEFAULT_PENDING_OP_AWAIT_MS, LifecycleBridge } from './lifecycle-bridge.js'
+import { observeArchives } from './archive-observer.js'
+import { AgentHintSignals } from './composing-service.js'
+import { HintTrace } from './trace.js'
+import { createSessionTraceSink } from './session-trace.js'
+
+export { buildManageHint, buildOrdinaryHint, deriveServingFacts, encodeAgentHintHeader, STATE_EDIT } from './hint.js'
+export type {
+  AgentHint, AgentHintCacheControl, AgentHintContextManagement, AgentHintEdit, AgentHintPriority,
+  AgentHintSession, ManageState, OrdinaryHintFacts, ManageHintFacts, SessionState, ServingFacts,
+} from './hint.js'
+export { BASE_URL_ENV, Config, DEFAULT_BASE_URL, DEFAULT_PROVIDER, INHERITED_BASE_URL_ENV, NO_INHERITED_CONNECTION,
+  plainOptions, resolveAdapterOptions, resolveBaseURL, resolveModels } from './config.js'
+export type { AgentHintConfig, CacheControlConfig, InheritedConnection, Options, PriorityConfig,
+  ResolvedAgentHintOptions, SessionControlConfig, StaticCacheControl } from './config.js'
+export { INHERIT_SOURCE_ID, readInheritedConnection } from './inherited-connection.js'
+export { DEFAULT_CONTROL_RETRIES, DEFAULT_CONTROL_TIMEOUT_MS, SessionControlClient } from './control-client.js'
+export type { ControlResult, ControlConnection, ControlWarnSink, ManageSessionFacts, SessionControlClientOptions } from './control-client.js'
+export { AgentHintAdapter, agentHintScope } from './adapter.js'
+export type { AgentHintAdapterOptions, MessagesHintFacts } from './adapter.js'
+export { agentHintAcceptExtensions } from './extension.js'
+export type { AgentHintExtensionOptions } from './extension.js'
+export { ControlBarrierError, COMPACTION_LINEAGE_WINDOW_MS, DEFAULT_PENDING_OP_AWAIT_MS, DEFAULT_QUARANTINE_TTL_MS, LifecycleBridge } from './lifecycle-bridge.js'
+export type { BridgeWarnSink, LifecycleBridgeOptions } from './lifecycle-bridge.js'
+export { HintTrace } from './trace.js'
+export type { HintTraceRecord, HintTraceSummary } from './trace-record.js'
+export { HINT_TRACE_RECORD_TYPE, createSessionTraceSink } from './session-trace.js'
+export type { HintTraceSessionSinkOptions } from './session-trace.js'
 
 export const name = 'agent-hints'
-
-/** The llm service is the mounting target; sessions/credentials are read through `ctx.get` so absence degrades gracefully. */
 export const inject = ['llm']
 
-/** The provider route this adapter owns; select it via `agent-default-model.provider`. */
-export const PROVIDER_ROUTE = 'deepseek-hint'
+/** The conventional manage-request path appended to `baseURL` when no explicit endpoint is configured. */
+export { chatCompletionsURL }
 
-/** The conventional status-endpoint path appended to `baseURL`'s origin when `statusAuto` is on — the Motor-coordinator convention (DSH ↔ Motor 对接约定). */
-export const STATUS_ENDPOINT_PATH = '/agent-status'
-
-/**
- * Mount the hinted adapter. The plugin is zero-config: endpoint/credential
- * facts inherit the DSH host (`$DEEPSEEK_BASE_URL` → public API default;
- * `DEEPSEEK_API_KEY` credential ref) and the patch-row config only overrides
- * per field. Provided-but-invalid config still aborts composition with a
- * field path.
- * @param ctx - the mounting Cordis context.
- * @param config - raw patch-row config.
- */
-export function apply(ctx: Context, config?: unknown): void {
-  const inherited = config === undefined || config === null
-  const pluginConfig = normalizeConfig(config)
-  if (inherited) {
-    ctx.logger?.info?.(`agent-hints: no config — inheriting the DSH host endpoint (${pluginConfig.baseURL})`
-      + ` and credential ref (${pluginConfig.apiKeyEnv})`)
-  }
-  const hintOptions: HintOptions = { agentType: pluginConfig.agentType }
-
-  // Join tracking: the parent's delegating tool call (`run_in_background`)
-  // fires on the firehose before the child's first request, so the child's
-  // hint reads the parent's track. Parallel delegations share the latest
-  // value — an accepted approximation (protocol join is per derivation).
-  const subagentTools = new Set(pluginConfig.subagentToolNames)
-  const delegationJoin = new Map<string, 'sync' | 'async'>()
-
-  // Serving facts: derive from the durable log when the session store is
-  // reachable; otherwise fall back to a per-process ordinal (the store is a
-  // dsh-base service, so the fallback only covers exotic compositions).
-  const fallbackCounter = new Map<string, number>()
-  const servingFacts = (sessionId: string): ServingFacts => {
-    const session = ctx.get('sessions')?.get(sessionId)
-    if (session !== undefined) return deriveServingFacts(session)
-    const next = (fallbackCounter.get(sessionId) ?? 0) + 1
-    fallbackCounter.set(sessionId, next)
-    return {
-      callIndex: next,
-      epoch: 0,
-      state: 'running',
-      stateSinceMs: undefined,
-      turnOpening: next === 1,
-      intervalMs: undefined,
-      afterCompaction: false,
+export function apply(ctx: Context, config: Config): void {
+  const lifetime = new AbortController()
+  ctx.effect(() => () => lifetime.abort(), 'agent-hint: adapter lifetime')
+  const provider = config.provider
+  const options = () => resolveAdapterOptions(plainOptions(config), launchEnvironmentOf(ctx), readInheritedConnection(ctx))
+  options()
+  const resolveApiKey = async (connection: ResolvedAgentHintOptions): Promise<string | undefined> => {
+    const ref = connection.apiKeyEnv
+    if (ref === undefined) return undefined
+    const credentials = ctx.get('credentials')
+    if (credentials !== undefined) {
+      const hit = await credentials.resolve(ref)
+      if (hit !== undefined) return assertUsableApiKey(hit.value, 'agent-hints', ref)
+    } else {
+      const ambient = launchEnvironmentOf(ctx).get(ref)
+      if (ambient !== undefined && ambient.value.length > 0) return assertUsableApiKey(ambient.value, 'agent-hints', ref)
     }
+    // An unauthenticated local coordinator may coexist with the stock route's
+    // default, unused DEEPSEEK_API_KEY reference. Explicit plugin refs are strict.
+    if (connection.credentialInherited) return undefined
+    throw new LlmError(
+      `agent-hints: no API key for provider route "${provider}"; store ${ref} through the credentials`
+      + ` service (the web Models page writes it), or export ${ref} in the launching environment`,
+      'MISSING_CREDENTIAL',
+    )
   }
 
-  // Dynamic two-level priority (handoff contract): a turn-opening request is
-  // user intervention (3 / user_waiting); everything else is self-driven
-  // continuation (1 / critical_path). A static config is a folded override;
-  // `null` omits the field.
+  const hintConfig = config.agentHint
+  const hintEnabled = hintConfig?.enabled !== false
+  const sessionControl = hintConfig?.sessionControl
+  const controlEnabled = hintEnabled && sessionControl?.enabled !== false
+  const traceConfig = hintConfig?.trace
+  const traceEnabled = traceConfig?.enabled !== false
+  const traceMaxRecords = traceConfig?.maxRecords ?? 2000
+  const priorityMode: PriorityConfig = hintConfig?.priority ?? 'dynamic'
+  const cacheMode: CacheControlConfig = hintConfig?.cacheControl ?? 'dynamic'
+
+  const sessionOf = (sessionId: string) => {
+    if (sessionId.length === 0) return undefined
+    return ctx.get('sessions')?.get(SessionId(sessionId))
+  }
+  const servingFacts = (sessionId: string): ServingFacts => {
+    const session = sessionOf(sessionId)
+    if (session !== undefined) return deriveServingFacts(session)
+    return { callIndex: 1, epoch: 0, turnOpening: true, intervalMs: undefined, afterCompaction: false }
+  }
+  // Ordinary history forks may name their source; a subagent names its creator instead.
+  const parentOf = (sessionId: string): string | undefined => {
+    const header = sessionOf(sessionId)?.header
+    if (header === undefined || header.origin === 'subagent') return undefined
+    return header.parentSession === undefined ? undefined : String(header.parentSession)
+  }
+  const manageFacts = (sessionId: string): ManageSessionFacts => {
+    const facts = servingFacts(sessionId)
+    return { callIndex: Math.max(1, facts.callIndex), epoch: facts.epoch, parentSessionId: parentOf(sessionId) }
+  }
   const priorityOf = (facts: ServingFacts): AgentHintPriority | undefined => {
-    const configured = pluginConfig.priority
-    if (configured === 'omit') return undefined
-    if (configured !== 'dynamic') return { level: configured.level, reason: configured.reason }
+    if (priorityMode === 'omit') return undefined
+    if (priorityMode !== 'dynamic') return { level: priorityMode.level, reason: priorityMode.reason }
     return facts.turnOpening
       ? { level: 3, reason: 'user_waiting' }
       : { level: 1, reason: 'critical_path' }
   }
-
-  // Prediction sources: the offline trie loads once at composition (any
-  // problem warns and degrades to statics); with neither source configured
-  // the block stays absent and the wire shape matches the pre-prediction
-  // plugin byte for byte.
-  const trie = pluginConfig.predictionTrie !== undefined
-    ? loadPredictionTrie(pluginConfig.predictionTrie, message => ctx.logger?.warn?.(message))
-    : undefined
-  const predictionSource: PredictionSource | undefined = trie !== undefined || pluginConfig.predictionStatic !== undefined
-    ? { trie, statics: pluginConfig.predictionStatic, minSamples: pluginConfig.predictionMinSamples }
-    : undefined
-  const predictionFacts = predictionSource === undefined
-    ? undefined
-    : (sessionId: string): AgentHintPrediction | undefined => {
-      const session = ctx.get('sessions')?.get(sessionId)
-      return resolvePredictionBlock(predictionSource, session === undefined ? [] : toolSequenceOf(session))
+  // Process-local prefix signature per session: a declaration from a different
+  // signature would pin a prefix the engine cached under another key.
+  const signatures = new Map<string, string>()
+  const cacheOf = (sessionId: string, model: string, toolNames: readonly string[],
+    wireMessageCount: number, prefixTokens: number, facts: ServingFacts): AgentHintCacheControl | undefined => {
+    if (cacheMode === 'omit') return undefined
+    const signature = cacheSignature(model, toolNames)
+    const previous = signatures.get(sessionId)
+    const stable = previous !== undefined ? previous === signature : facts.callIndex <= 1
+    signatures.set(sessionId, signature)
+    if (!stable || facts.afterCompaction) return undefined
+    if (cacheMode !== 'dynamic') {
+      return { type: 'ephemeral', ttl_s: cacheMode.ttl_s, msg_offset: cacheMode.msg_offset ?? wireMessageCount }
     }
+    return buildCacheControl(wireMessageCount, prefixTokens, facts.intervalMs)
+  }
 
-  ctx.on('session/event', (session: SessionLike, event: SessionEventLike) => {
-    if (event.type === 'tool/call') {
-      const toolName = event.data?.name
-      if (toolName !== undefined && subagentTools.has(toolName)) {
-        let runInBackground: unknown
-        try {
-          runInBackground = JSON.parse(event.data?.arguments ?? '{}')?.run_in_background
-        } catch {
-          // Unparseable arguments default to the foreground-wait (`sync`) below.
-        }
-        delegationJoin.set(session.id, runInBackground === true ? 'async' : 'sync')
+  // Live Session lookup for the durable trace writer, resolved per call so a
+  // host without the store, or one that loads later, degrades to stdout.
+  const liveSession = (sessionId: string) => sessionOf(sessionId)
+  const writeSessionRecord = traceEnabled && traceConfig?.writeToSession !== false
+    ? createSessionTraceSink({ resolveSession: liveSession, maxRecords: traceMaxRecords,
+      warn: message => ctx.logger.warn(message) })
+    : undefined
+  const trace = new HintTrace({ enabled: traceEnabled,
+    maxRecords: traceMaxRecords,
+    // Stock Web may suppress info-level framework logs. Explicit stdout keeps
+    // this diagnostic channel available to Docker / service log collection.
+    log: record => console.info(`agent-hint/trace ${JSON.stringify(record)}`),
+    ...writeSessionRecord === undefined ? {} : { writeSessionRecord } })
+  const bridge = controlEnabled
+    ? new LifecycleBridge({
+      client: new SessionControlClient({
+        endpoint: sessionControl?.endpoint ?? chatCompletionsURL(options().baseURL),
+        resolveApiKey: async () => resolveApiKey(options()),
+        resolveConnection: async () => {
+          const connection = options()
+          const endpoint = sessionControl?.endpoint ?? chatCompletionsURL(connection.baseURL)
+          if (connection.apiKeyEnv !== undefined && new URL(endpoint).origin !== new URL(connection.baseURL).origin) {
+            throw new Error('agent-hints: refusing to forward model credentials to a different control origin')
+          }
+          return {
+            endpoint,
+            apiKey: await resolveApiKey(connection),
+            authHeader: connection.authHeader,
+          }
+        },
+        model: options().models[0]?.id ?? 'default',
+        timeoutMs: sessionControl?.controlTimeoutMs ?? DEFAULT_CONTROL_TIMEOUT_MS,
+        retries: sessionControl?.retries ?? DEFAULT_CONTROL_RETRIES,
+        sessionFacts: manageFacts,
+        trace,
+        warn: (message, error) => {
+          ctx.logger.warn(message)
+          if (error !== undefined) ctx.logger.warn(error)
+        },
+      }),
+      pendingOpAwaitMs: sessionControl?.pendingOpAwaitMs ?? DEFAULT_PENDING_OP_AWAIT_MS,
+      warn: message => ctx.logger.warn(message),
+    })
+    : undefined
+  bridge?.subscribe(ctx)
+  if (bridge !== undefined && sessionControl?.pluginTriggers !== false) {
+    ctx.inject(['typertGateway'], (scope) => { scope.plugin(AgentHintSignals, bridge) })
+    ctx.inject(['workspaceRegistry'], (scope) => {
+      try {
+        scope.effect(() => observeArchives(scope.workspaceRegistry,
+          id => bridge.onSessionArchived(id), id => bridge.onSessionUnarchived(id)),
+        'agent-hint: observe public archive methods')
+      } catch (error) {
+        ctx.logger.warn('agent-hint: archive observer unavailable; disposal stop remains active', error)
       }
-    }
-  })
-
-  // Out-of-band status channel: activate when any sink is configured. The
-  // HTTP endpoint resolves in priority order — explicit `statusEndpoint`
-  // override, else the `statusAuto` derivation from `baseURL`'s origin
-  // (`<origin>/agent-status`, the Motor-coordinator convention). Both sinks
-  // may coexist: the JSONL file keeps a local trace while HTTP streams events
-  // to the scheduler; a gateway client later replaces the HTTP sink behind
-  // the same `emit` seam.
-  const statusHttpEndpoint = pluginConfig.statusEndpoint
-    ?? (pluginConfig.statusAuto === true ? new URL(pluginConfig.baseURL).origin + STATUS_ENDPOINT_PATH : undefined)
-  if (pluginConfig.statusSink !== undefined || statusHttpEndpoint !== undefined) {
-    const sinks: Array<(event: StatusEvent) => void> = []
-    if (pluginConfig.statusSink !== undefined) {
-      const sinkPath = pluginConfig.statusSink
-      sinks.push(event => appendStatusEvent(sinkPath, event, message => ctx.logger?.warn?.(message)))
-    }
-    if (statusHttpEndpoint !== undefined) {
-      const httpSink = new HttpStatusSink(statusHttpEndpoint, message => ctx.logger?.warn?.(message))
-      sinks.push(event => httpSink.send(event))
-    }
-    const observer = new StatusObserver(event => {
-      for (const sink of sinks) sink(event)
-    }, subagentTools)
-    ctx.on('session/event', (session: SessionLike, event: SessionEventLike) => observer.onEvent(session, event))
-    // `finalize` is session-scoped: the disposal is the session's end of
-    // life, so it carries the completion verdict — never `turn/end`.
-    ctx.on('session/disposed', (session: SessionLike) => observer.onDispose(session))
+    })
   }
 
-  const resolveApiKey = async (): Promise<string> => {
-    const ref = pluginConfig.apiKeyEnv
-    const hit = await ctx.get('credentials')?.resolve(ref)
-    if (hit?.value !== undefined && hit.value.length > 0) return hit.value
-    const ambient = process.env[ref]
-    if (ambient !== undefined && ambient.length > 0) return ambient
-    throw new Error(
-      `agent-hints: no API key for provider route "${PROVIDER_ROUTE}"; store ${ref} through the credentials`
-      + ` service, or export ${ref} in the launching environment`,
-    )
+  ctx.llm.registerConfigurableProviders([
+    { provider, displayName: 'DeepSeek (agent-hint)', settingsNs: ctx.fiber.entry?.options.id ?? name, settingsPath: [], declared: true },
+  ])
+  const chained = (request: Parameters<ReturnType<typeof agentHintAcceptExtensions>>[0]) =>
+    ctx.get('deepseekLlmApiExtensions')?.prepare(request)
+      ?? Promise.resolve({ fields: {}, accept: () => Promise.resolve() })
+  const authForConnection = async (connection: ResolvedAgentHintOptions) => {
+    const key = await resolveApiKey(connection)
+    const headers: Record<string, string> = {}
+    if (key !== undefined) headers[connection.authHeader] = connection.authHeader === 'authorization' ? `Bearer ${key}` : key
+    return { headers }
   }
-  const adapter = new HintedDeepSeekAdapter({
-    config: pluginConfig,
-    hintOptions,
-    servingFacts,
-    priorityOf,
-    predictionFacts,
-    derivationJoin: sessionId => delegationJoin.get(sessionId),
-    sessionHeader: sessionId => ctx.get('sessions')?.get(sessionId)?.header,
-    resolveApiKey,
-  })
-  ctx.llm.registerAdapter([PROVIDER_ROUTE], adapter)
+  // The Messages adapter has no per-request header hook; it carries the hint
+  // through `agentHintScope` and `resolveAuth` spreads it into the request.
+  const authForMessages = async (connection: ResolvedAgentHintOptions) => {
+    const { headers } = await authForConnection(connection)
+    const hint = agentHintScope.getStore()
+    if (hint !== undefined) headers['x-agent-hint'] = encodeAgentHintHeader(hint)
+    return { headers }
+  }
+  const prepareHint = (request: {
+    sessionId: string | undefined
+    purpose: string | undefined
+    model: string
+    wireMessageCount: number
+    prefixTokens: number
+    toolNames: readonly string[]
+  }) => {
+    if (!hintEnabled) return undefined
+    // Any declared purpose is a background call that must not perturb the live session.
+    if (request.purpose !== undefined) return undefined
+    if (request.sessionId === undefined) return undefined
+    const id = request.sessionId
+    const facts = bridge?.facts(SessionId(id)) ?? { seeded: false, firstOrdinarySent: true, parentSessionId: undefined }
+    const serving = servingFacts(id)
+    return buildOrdinaryHint({
+      sessionId: id,
+      parentSessionId: parentOf(id),
+      callIndex: Math.max(1, serving.callIndex),
+      epoch: serving.epoch,
+      state: !facts.seeded && !facts.firstOrdinarySent ? 'start' : 'append',
+      priority: priorityOf(serving),
+      cacheControl: cacheOf(id, request.model, request.toolNames, request.wireMessageCount, request.prefixTokens, serving),
+    })
+  }
+  const onAccepted = (request: { sessionId: string | undefined; purpose: string | undefined; model: string }) => {
+    if (hintEnabled && request.purpose === undefined) {
+      bridge?.noteOrdinaryRequest(request.sessionId === undefined ? undefined : SessionId(request.sessionId), request.model)
+    }
+  }
+  const adapter = config.transport === 'chat' ? new ChatCompletionsAdapter({
+    options,
+    providerName: 'DeepSeek (agent-hint)',
+    resolveAuth: authForConnection,
+    bridge,
+    signal: lifetime.signal,
+    trace,
+    prepareHint,
+    onAccepted,
+  }) : new AgentHintAdapter({
+    options,
+    providerName: 'DeepSeek (agent-hint)',
+    resolveUserId: getOrCreateAnonymousUserId,
+    resolveAttachments: () => ctx.get('attachments'),
+    resolveImageAccess: (attachments, ref) => resolveImageAttachmentAccess(attachments,
+      hostPath => ctx.get('fs')?.processPathFromHostPath(hostPath), ref),
+    resolveAuth: authForMessages,
+    discoverModels: route => Promise.resolve(options().models.map(model => catalogModelInfo(route, model))),
+    prepareExtensions: hintEnabled
+      ? agentHintAcceptExtensions({ chained, ...bridge === undefined ? {} : { bridge } })
+      : chained,
+    prepareHint,
+  }, bridge, lifetime.signal)
+  const registration = ctx.llm.registerAdapter([provider], adapter)
+  let signature = ''
+  const refresh = () => {
+    const current = options()
+    const next = JSON.stringify(current)
+    if (next === signature) return
+    signature = next
+    registration.replace([provider])
+    ctx.logger.info(`agent-hint: provider=${provider} origin=${new URL(current.baseURL).origin} models=${current.models.length} credential=${current.apiKeyEnv === undefined ? 'none' : current.credentialInherited ? 'inherited-reference' : 'explicit-reference'}`)
+    if (current.models.length === 0) ctx.logger.warn('agent-hint: no selectable models; configure the source llm-deepseek route or explicit plugin models')
+  }
+  // Source changes are scoped to a sibling fiber; topology changes include reload/remove.
+  ctx.on('loader/volatile-update', refresh, { global: true })
+  ctx.on('loader/config-update', refresh, { global: true })
+  ctx.on('loader/entry-init', refresh, { global: true })
+  // 0.2.2 additionally announces a catalog change on the route itself, which is the
+  // narrowest signal for an inherited `models`/`baseURL` edit. It is an addition, not a
+  // replacement: the loader/`internal/status` path below stays as the fallback so a host
+  // that never emits it still refreshes.
+  ctx.on('llm/models-updated', provider => {
+    if (provider !== INHERIT_SOURCE_ID) return
+    try { refresh() } catch (error) { ctx.logger.warn('agent-hint: source refresh failed', error) }
+  }, { global: true })
+  // Entry creation precedes activation. Refresh after a source reaches/leaves
+  // active state too, including disable, removal and re-addition.
+  let disposed = false
+  let refreshQueued = false
+  ctx.effect(() => () => { disposed = true }, 'agent-hint: catalog refresh')
+  ctx.on('internal/status', fiber => {
+    if (fiber.entry?.options.id !== INHERIT_SOURCE_ID || refreshQueued) return
+    refreshQueued = true
+    queueMicrotask(() => {
+      refreshQueued = false
+      if (!disposed) {
+        try { refresh() } catch (error) { ctx.logger.warn('agent-hint: source refresh failed', error) }
+      }
+    })
+  }, { global: true })
+  refresh()
 }
